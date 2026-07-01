@@ -1,0 +1,1 @@
+DEV_DROP_STUB_V1 object_id=object_alpha hash=blake3:2488050d0ba2aef5b0df3a7712f6eee3b1f51120bf452632ea01d65bbae0a4bf size=65

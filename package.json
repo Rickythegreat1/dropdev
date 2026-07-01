@@ -1,0 +1,16 @@
+{
+  "name": "devdrop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "DevDrop monorepo: local-first workspace coherence for developers, machines, and coding agents.",
+  "scripts": {
+    "typecheck": "pnpm --recursive --if-present typecheck",
+    "test": "pnpm --recursive --if-present test",
+    "desktop:dev": "pnpm --filter @devdrop/desktop dev",
+    "desktop:tauri": "pnpm --filter @devdrop/desktop tauri dev"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.4"
+  },
+  "packageManager": "pnpm@9.15.4"
+}

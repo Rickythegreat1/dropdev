@@ -1,0 +1,14 @@
+# DevDrop Codex configuration stub.
+# Hooks are present for future loops but are intentionally inert in Slice 0/1.
+# Project-local config may document recommended hooks, skills, and MCP wiring.
+# Do not use this file for provider/model routing that Codex only supports in
+# user-level configuration.
+
+[devdrop]
+slice = "0/1"
+hooks_auto_enabled = false
+hooks_trusted = false
+destructive_actions = "blocked"
+secret_values = "never-capture"
+mcp_transport = "stdio-json-scaffold"
+mcp_protocol = "not-complete"

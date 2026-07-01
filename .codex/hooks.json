@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "autoEnabled": false,
+  "trusted": false,
+  "notes": "DevDrop hooks are intentionally present but disabled, dry-run, and untrusted in Slice 0/1. This file documents future wiring only; it must not auto-activate hooks.",
+  "hooks": [
+    {
+      "name": "secret-output-guard",
+      "path": ".codex/hooks/secret-output-guard.ts",
+      "enabled": false,
+      "trusted": false,
+      "mode": "dry-run",
+      "notes": "Future guard for output redaction; currently inert and non-blocking."
+    },
+    {
+      "name": "destructive-command-guard",
+      "path": ".codex/hooks/destructive-command-guard.ts",
+      "enabled": false,
+      "trusted": false,
+      "mode": "dry-run",
+      "notes": "Future guard for destructive command approval; currently inert and non-blocking."
+    },
+    {
+      "name": "design-slop-guard",
+      "path": ".codex/hooks/design-slop-guard.ts",
+      "enabled": false,
+      "trusted": false,
+      "mode": "dry-run",
+      "notes": "Future guard for visual critique; currently inert and non-blocking."
+    }
+  ]
+}

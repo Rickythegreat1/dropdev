@@ -1,0 +1,2 @@
+DevDrop fixture object alpha.
+Hydrated from a test sandbox only.
