@@ -26,9 +26,9 @@ fn successful(state: &Path, args: &[&str]) -> Value {
 #[test]
 fn separate_process_registration_preview_approval_and_restore() {
     let temp = tempfile::tempdir().unwrap();
-    let source = temp.path().join("source");
-    let target = temp.path().join("target");
-    let state = temp.path().join("state");
+    let source = fs::canonicalize(temp.path()).unwrap().join("source");
+    let target = fs::canonicalize(temp.path()).unwrap().join("target");
+    let state = fs::canonicalize(temp.path()).unwrap().join("state");
     fs::create_dir(&source).unwrap();
     fs::create_dir(&target).unwrap();
     fs::write(source.join("hello.txt"), b"hello fixture").unwrap();
@@ -77,9 +77,9 @@ fn separate_process_registration_preview_approval_and_restore() {
 #[test]
 fn stale_preview_cannot_overwrite_a_new_target_edit() {
     let temp = tempfile::tempdir().unwrap();
-    let source = temp.path().join("source");
-    let target = temp.path().join("target");
-    let state = temp.path().join("state");
+    let source = fs::canonicalize(temp.path()).unwrap().join("source");
+    let target = fs::canonicalize(temp.path()).unwrap().join("target");
+    let state = fs::canonicalize(temp.path()).unwrap().join("state");
     fs::create_dir(&source).unwrap();
     fs::create_dir(&target).unwrap();
     fs::write(source.join("code.txt"), b"incoming").unwrap();

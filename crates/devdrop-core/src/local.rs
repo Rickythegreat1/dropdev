@@ -1303,9 +1303,9 @@ mod tests {
     impl Workspace {
         fn new() -> Self {
             let temp = tempfile::tempdir().unwrap();
-            let source = temp.path().join("source");
-            let target = temp.path().join("target");
-            let state = temp.path().join("state");
+            let source = fs::canonicalize(temp.path()).unwrap().join("source");
+            let target = fs::canonicalize(temp.path()).unwrap().join("target");
+            let state = fs::canonicalize(temp.path()).unwrap().join("state");
             fs::create_dir(&source).unwrap();
             fs::create_dir(&target).unwrap();
             Self {

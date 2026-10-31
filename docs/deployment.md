@@ -141,3 +141,9 @@ The next platform run exposed a pre-existing package-manager mismatch:
 package.json declared pnpm 9. The declared manager is now pinned to the tested
 pnpm 11.19.0, so frozen installs consume the same override configuration as the
 local build. Do not treat the earlier pnpm-install failures as OS build results.
+
+Platform tests also account for Git LFS filters preconfigured on hosted runners:
+a nested-worktree refusal due to external filters is accepted as a fail-closed
+result, without executing those filters. Disposable fixture roots use their
+canonical temporary-directory paths so macOS `/var` aliases do not conflict with
+the runtime's deliberate symlink-path refusal.

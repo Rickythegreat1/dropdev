@@ -12,9 +12,9 @@ struct Workspace {
 impl Workspace {
     fn new() -> Self {
         let temp = tempfile::tempdir().unwrap();
-        let source = temp.path().join("source");
-        let target = temp.path().join("target");
-        let state = temp.path().join("metadata");
+        let source = fs::canonicalize(temp.path()).unwrap().join("source");
+        let target = fs::canonicalize(temp.path()).unwrap().join("target");
+        let state = fs::canonicalize(temp.path()).unwrap().join("metadata");
         fs::create_dir(&source).unwrap();
         fs::create_dir(&target).unwrap();
         Self {
@@ -148,12 +148,20 @@ fn dirty_git_is_detected_when_registered_root_is_inside_worktree() {
     let pair = engine
         .register("nested generated fixture", &nested, &w.target)
         .unwrap();
-    let plan = engine.preview(&pair.id).unwrap();
-    assert!(
-        !plan.blockers.is_empty(),
-        "nested root silently bypassed dirty Git gate"
-    );
-    assert!(engine.apply(&plan.id, &plan.id).is_err());
+    match engine.preview(&pair.id) {
+        Ok(plan) => {
+            assert!(
+                !plan.blockers.is_empty(),
+                "nested root silently bypassed dirty Git gate"
+            );
+            assert!(engine.apply(&plan.id, &plan.id).is_err());
+        }
+        Err(error) => {
+            // Standard hosted runners configure Git LFS globally. A refusal to
+            // execute any external filter is also a valid nested-worktree gate.
+            assert!(error.to_string().contains("External Git filters"));
+        }
+    }
     assert!(!w.target.join("work.txt").exists());
 }
 
