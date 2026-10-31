@@ -153,3 +153,11 @@ bare canonical drive prefix is invalid on Windows. Prefix components are now
 accumulated before metadata checks begin at the full drive root; checks of every
 real root/ancestor component remain enforced. The real CLI process tests are the
 regression gate for this Windows-specific failure.
+
+Windows CLI process tests passed after the prefix fix. Broader tests caught two
+additional portability defects: nested walker paths used backslashes before
+portable-path validation, and checkout CRLF conversion changed fixture bytes.
+The walker now normalizes its internally generated relative paths; user-supplied
+backslashes remain rejected. `.gitattributes` pins text to LF and marks native
+icons binary, keeping fixture hashes stable. CI concurrency is per commit so
+already-running Unix packaging can finish while the Windows fixes are verified.

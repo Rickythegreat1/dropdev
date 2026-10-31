@@ -867,7 +867,7 @@ impl Engine {
                         return false;
                     }
                 };
-                match excluded(&scan_root, relative) {
+                match excluded(&scan_root, &relative.replace('\\', "/")) {
                     Ok(exclude) => !exclude,
                     Err(e) => {
                         *filter_error.lock().unwrap() = Some(e);
