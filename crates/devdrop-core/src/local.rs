@@ -998,6 +998,29 @@ fn reject_symlinks(path: &Path) -> Result<()> {
 }
 fn root(path: &Path) -> Result<PathBuf> {
     let p = absolute(path)?;
+    if p.components().any(|component| match component {
+        Component::Normal(name) => {
+            let name = name.to_string_lossy().to_lowercase();
+            name.starts_with(".env")
+                || matches!(
+                    name.as_str(),
+                    ".ssh"
+                        | ".aws"
+                        | ".azure"
+                        | ".docker"
+                        | ".kube"
+                        | ".gnupg"
+                        | ".netrc"
+                        | "credentials"
+                        | "secrets"
+                )
+        }
+        _ => false,
+    }) {
+        return Err(err(
+            "Credential directories cannot be registered as project roots.",
+        ));
+    }
     reject_symlinks(&p)?;
     let p = io(fs::canonicalize(p))?;
     if !p.is_dir() {
