@@ -7,7 +7,7 @@ fn binary_streams_only_jsonrpc_and_refuses_mutation_tools() {
     let state = tempfile::tempdir().unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_devdrop-mcp"))
         .arg("--state-dir")
-        .arg(state.path())
+        .arg(std::fs::canonicalize(state.path()).unwrap())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
