@@ -142,3 +142,21 @@ Linux/Windows/macOS installers and command-line binaries; optional release
 creation remains an unpublished draft. Native builds need GTK/WebKit on Linux.
 See [deployment details](docs/deployment.md), [runtime review](docs/runtime-review.md)
 and [implementation record](docs/loop-log.md) for verified outcomes and blockers.
+
+## Cross-device simulation
+
+The fixture-only peer example exercises independent identities/state, packet
+delivery faults, local preview/approval, conflicts, recovery and permission gates.
+It creates disposable data and does not import real projects:
+
+```sh
+cargo test -p devdrop-core --example peer_simulation --locked
+cargo run -p devdrop-core --example peer_simulation --locked -- local
+```
+
+The separate VM simulation workflow relays generated packet artifacts from a
+sender VM to a receiver VM and checks its reply on a third verifier VM. It is a
+store-and-forward test, with simulated offline/reconnect faults. It does not
+implement production peer networking, pairing or authentication. See the
+[exact topology and acceptance boundary](docs/peer-simulation.md) before using
+its results as cross-device evidence.

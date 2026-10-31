@@ -272,3 +272,72 @@ enabled. The final local suite passed 123 Rust tests, all-target checks, optimiz
 builds and generated-folder CLI copy/mode/widening/original-inode rollback proof;
 18 UI tests and Chromium checks remain valid because UI did not change in this
 correction. Native-platform results are recorded with the exact-commit handoff.
+
+## 2026-10-31 — Cross-device fixture exchange on independent CI VMs
+
+1. **Task/scope before coding.** User requested multiple-VM cross-device
+   simulation. Verify actual capability first; local executor has no hypervisor,
+   VM runtime, guest image, peer network or cloud provisioning identity. DevDrop
+   has no production peer transport/pairing. Touched files are the standalone
+   core Rust example `examples/peer_simulation.rs`, a new three-job VM simulation
+   workflow, and simulation/verification documentation. Production runtime and
+   UI are outside this slice.
+2. **Risk.** High for filesystem/permission model, medium for CI artifact/evidence
+   integrity. Only generated disposable fixtures. No Docker, real project paths,
+   secret values, new credentials, accounts, firewall changes, services or paid
+   resources. Public-repository standard hosted VMs only. Preserve the exact-plan,
+   disposable intent and widening gates; fixed test tags are not authentication.
+3. **Planned implementation.** Independent sender/receiver identities, SQLite
+   state, CAS and generated workspaces; bounded serialized fixture envelopes;
+   journaled sequence/digest checks; exact local preview/approved apply and
+   retained-inode recovery. New CI jobs pass fixture artifacts A -> B -> verifier
+   C with distinct boot fingerprints and same run/SHA. C is not original A.
+4. **Tests/evals.** Local deterministic scenario and explicit example tests;
+   initial transfer, withheld/reordered packet, reconnect, conflicts retaining
+   versions, deletion/rollback, restart/replay idempotence, altered frames,
+   wrong identity/path and permission-consent refusal. Then actual three-VM
+   artifact exchange, separately from ordinary platform build jobs. No claim of
+   direct sockets, physical network outage/reboot or production security.
+5. **UX/review criteria.** No application UI change. Docs and reports must say
+   simulator vs actual VM artifact relay, identify exact topology and never show
+   raw content or test keys. Required sync/security review covers validation,
+   staging-only acceptance, local mutation gates and durable replay evidence.
+6. **Closeout pending.** Run affected tests and both VM/standard CI to terminal;
+   update the same portable Library handoff with exact source/evidence. Record
+   failed and never-run checks truthfully. No denied PR retry, Sites bypass,
+   permission expansion or unsupported claim of completed cross-device sync.
+
+### Local implementation and review checkpoint
+
+The standalone example now passes three unit tests and fourteen receiver-scenario
+checks. Independent review also ran offer/receive/verify as three local subprocesses
+with only the relayed manifests copied and artifact-style mode normalization;
+all 3/14/5 phase checks passed. These are single-executor results, not VM proof.
+The full workspace still passes 123 Rust tests, all-target checking, formatting
+and optimized builds. No production UI/runtime/dependency/lock changes occurred.
+
+Review corrections made Unix private directory creation atomic, validated full
+opened-file access guards for rollback on supported platforms, and reread every
+accepted serialized packet plus staged flag after final SQLite reopen. Named
+manifest reads are bounded, strict, non-symlink regular files; adjacent files are
+ignored. Output roots must be new and separate from inputs. Only exact generated
+payloads/path/policy are accepted. Automated fixture approvals do not establish a
+remote human-approval path. Source-mode metadata is reconstructed from the fixed
+fixture intent; artifact modes are not source permission evidence.
+
+The CI workflow now relays only manifest/evidence/runtime files, preserving
+separate sender/receiver workspaces, SQLite state and object stores. Its third
+verifier checks distinct boot fingerprints, Ubuntu22.04/x86_64, role, source SHA,
+run and attempt. It emits sanitized prefixed proof only. Actual hosted VM execution
+and ordinary platform jobs must finish successfully for the exact source before
+being marked passed in the portable handoff. Physical network interruption,
+guest reboot, direct sockets, secure pairing/transport and communicating mixed-OS
+peers remain never-run or unimplemented. No denied operation was retried.
+
+An optional strict Clippy run stopped on existing production-core style findings
+(`derivable_impls` in content_hash.rs and `too_many_arguments` in local.rs).
+Production files were kept unchanged. This is recorded separately from the
+passing runtime/test gates; a scoped example lint pass may allow those known
+style categories, without treating that as a clean strict whole-core lint.
+The scoped example Clippy pass succeeded with command-line allowances for those
+two existing style categories; it reported no additional example warnings.

@@ -1,0 +1,249 @@
+name: Three VM fixture relay simulation
+
+on:
+  push:
+    branches: ["codex/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: peer-vm-simulation-${{ github.sha }}
+  cancel-in-progress: true
+
+# Each job receives a fresh standard GitHub-hosted VM. Only generated fixtures
+# cross the job boundary through Actions artifacts; this is not a direct peer
+# connection, production pairing, or a test of physical network disconnection.
+jobs:
+  peer_a:
+    name: VM A creates generated fixture offer
+    if: github.event.repository.private == false
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - name: Test fixture simulator
+        run: cargo test -p devdrop-core --example peer_simulation --locked
+      - name: Create offer in a new disposable directory
+        run: cargo run -p devdrop-core --example peer_simulation --locked -- offer --output "${RUNNER_TEMP}/offer"
+      - name: Record VM A runtime evidence
+        env:
+          EVIDENCE_DIRECTORY: ${{ runner.temp }}/offer
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, platform, re
+          from pathlib import Path
+          boot = Path('/proc/sys/kernel/random/boot_id').read_bytes()
+          assert re.fullmatch(r'[0-9a-fA-F-]{36}', boot.decode().strip()), 'Missing kernel boot identity'
+          assert os.environ['RUNNER_ENVIRONMENT'] == 'github-hosted'
+          architecture = platform.machine()
+          distro_version_id = platform.freedesktop_os_release()['VERSION_ID']
+          assert architecture == 'x86_64' and distro_version_id == '22.04'
+          record = {
+              'schema_version': 1, 'role': 'peer_a',
+              'platform': platform.system(), 'kernel': platform.release(),
+              'architecture': architecture, 'distro_version_id': distro_version_id,
+              'boot_id_sha256': hashlib.sha256(boot).hexdigest(),
+              'github_job': os.environ['GITHUB_JOB'],
+              'run_id': os.environ['GITHUB_RUN_ID'],
+              'run_attempt': os.environ['GITHUB_RUN_ATTEMPT'],
+              'commit': os.environ['GITHUB_SHA'],
+              'runner_environment': os.environ['RUNNER_ENVIRONMENT'],
+          }
+          (Path(os.environ['EVIDENCE_DIRECTORY']) / 'runtime.json').write_text(json.dumps(record, indent=2) + '\n')
+          PY
+      - name: Relay generated offer to VM B
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: peer-vm-offer-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/offer/offer.json
+            ${{ runner.temp }}/offer/evidence.json
+            ${{ runner.temp }}/offer/runtime.json
+          if-no-files-found: error
+          include-hidden-files: false
+          retention-days: 7
+
+  peer_b:
+    name: VM B receives fixture offer and returns receipt
+    needs: peer_a
+    if: github.event.repository.private == false
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - name: Download this run's generated offer
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4, verified upstream tag
+        with:
+          name: peer-vm-offer-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/offer
+      - name: Test fixture simulator
+        run: cargo test -p devdrop-core --example peer_simulation --locked
+      - name: Receive fixture offer in a new disposable directory
+        run: cargo run -p devdrop-core --example peer_simulation --locked -- receive --input "${RUNNER_TEMP}/offer" --output "${RUNNER_TEMP}/reply"
+      - name: Record VM B runtime evidence
+        env:
+          EVIDENCE_DIRECTORY: ${{ runner.temp }}/reply
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, platform, re
+          from pathlib import Path
+          boot = Path('/proc/sys/kernel/random/boot_id').read_bytes()
+          assert re.fullmatch(r'[0-9a-fA-F-]{36}', boot.decode().strip()), 'Missing kernel boot identity'
+          assert os.environ['RUNNER_ENVIRONMENT'] == 'github-hosted'
+          architecture = platform.machine()
+          distro_version_id = platform.freedesktop_os_release()['VERSION_ID']
+          assert architecture == 'x86_64' and distro_version_id == '22.04'
+          record = {
+              'schema_version': 1, 'role': 'peer_b',
+              'platform': platform.system(), 'kernel': platform.release(),
+              'architecture': architecture, 'distro_version_id': distro_version_id,
+              'boot_id_sha256': hashlib.sha256(boot).hexdigest(),
+              'github_job': os.environ['GITHUB_JOB'],
+              'run_id': os.environ['GITHUB_RUN_ID'],
+              'run_attempt': os.environ['GITHUB_RUN_ATTEMPT'],
+              'commit': os.environ['GITHUB_SHA'],
+              'runner_environment': os.environ['RUNNER_ENVIRONMENT'],
+          }
+          (Path(os.environ['EVIDENCE_DIRECTORY']) / 'runtime.json').write_text(json.dumps(record, indent=2) + '\n')
+          PY
+      - name: Relay generated receipt to VM C
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: peer-vm-reply-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/reply/reply.json
+            ${{ runner.temp }}/reply/evidence.json
+            ${{ runner.temp }}/reply/runtime.json
+          if-no-files-found: error
+          include-hidden-files: false
+          retention-days: 7
+
+  peer_c:
+    name: VM C independently verifies offer, reply, and VM identities
+    needs: [peer_a, peer_b]
+    if: github.event.repository.private == false
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - name: Download original generated offer
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: peer-vm-offer-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/offer
+      - name: Download generated receiver receipt
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: peer-vm-reply-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/reply
+      - name: Test fixture simulator
+        run: cargo test -p devdrop-core --example peer_simulation --locked
+      - name: Verify receipt binding and fixture outcomes
+        run: cargo run -p devdrop-core --example peer_simulation --locked -- verify --offer "${RUNNER_TEMP}/offer" --reply "${RUNNER_TEMP}/reply" --output "${RUNNER_TEMP}/verification"
+      - name: Record VM C runtime evidence
+        env:
+          EVIDENCE_DIRECTORY: ${{ runner.temp }}/verification
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, platform, re
+          from pathlib import Path
+          boot = Path('/proc/sys/kernel/random/boot_id').read_bytes()
+          assert re.fullmatch(r'[0-9a-fA-F-]{36}', boot.decode().strip()), 'Missing kernel boot identity'
+          assert os.environ['RUNNER_ENVIRONMENT'] == 'github-hosted'
+          architecture = platform.machine()
+          distro_version_id = platform.freedesktop_os_release()['VERSION_ID']
+          assert architecture == 'x86_64' and distro_version_id == '22.04'
+          record = {
+              'schema_version': 1, 'role': 'peer_c',
+              'platform': platform.system(), 'kernel': platform.release(),
+              'architecture': architecture, 'distro_version_id': distro_version_id,
+              'boot_id_sha256': hashlib.sha256(boot).hexdigest(),
+              'github_job': os.environ['GITHUB_JOB'],
+              'run_id': os.environ['GITHUB_RUN_ID'],
+              'run_attempt': os.environ['GITHUB_RUN_ATTEMPT'],
+              'commit': os.environ['GITHUB_SHA'],
+              'runner_environment': os.environ['RUNNER_ENVIRONMENT'],
+          }
+          (Path(os.environ['EVIDENCE_DIRECTORY']) / 'runtime.json').write_text(json.dumps(record, indent=2) + '\n')
+          PY
+      - name: Verify independent VM boots and matching run provenance
+        run: |
+          python3 - <<'PY'
+          import json, os, re
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP'])
+          folders = {'peer_a': 'offer', 'peer_b': 'reply', 'peer_c': 'verification'}
+          records = {}
+          for role, folder in folders.items():
+              path = root / folder / 'runtime.json'
+              assert path.is_file() and not path.is_symlink() and path.stat().st_size <= 8192
+              record = json.loads(path.read_text())
+              assert set(record) == {'schema_version', 'role', 'platform', 'kernel', 'architecture', 'distro_version_id', 'boot_id_sha256', 'github_job', 'run_id', 'run_attempt', 'commit', 'runner_environment'}
+              assert record['schema_version'] == 1 and record['role'] == role
+              assert record['github_job'] == role and record['runner_environment'] == 'github-hosted'
+              assert record['platform'] == 'Linux' and re.fullmatch(r'[A-Za-z0-9._+-]{1,128}', record['kernel'])
+              assert record['architecture'] == 'x86_64' and record['distro_version_id'] == '22.04'
+              assert record['run_id'] == os.environ['GITHUB_RUN_ID']
+              assert record['run_attempt'] == os.environ['GITHUB_RUN_ATTEMPT']
+              assert record['commit'] == os.environ['GITHUB_SHA']
+              assert re.fullmatch(r'[0-9a-f]{64}', record['boot_id_sha256'])
+              records[role] = record
+          assert len({record['boot_id_sha256'] for record in records.values()}) == 3, 'VM boot identities must be independent'
+          proof = {
+              'schema_version': 1,
+              'transport': 'store-and-forward GitHub Actions generated-fixture artifacts',
+              'independent_vm_boots': True,
+              'same_run_attempt_and_commit': True,
+              'run_id': os.environ['GITHUB_RUN_ID'],
+              'run_attempt': os.environ['GITHUB_RUN_ATTEMPT'],
+              'commit': os.environ['GITHUB_SHA'],
+              'peers': records,
+          }
+          (root / 'verification' / 'runtime-verification.json').write_text(json.dumps(proof, indent=2) + '\n')
+          print('PEER_VM_RUNTIME_EVIDENCE=' + json.dumps(proof, sort_keys=True))
+          PY
+      - name: Print sanitized fixture scenario evidence
+        run: |
+          python3 - <<'PY'
+          import json, os, re
+          from pathlib import Path
+          path = Path(os.environ['RUNNER_TEMP']) / 'verification' / 'evidence.json'
+          assert path.is_file() and not path.is_symlink() and path.stat().st_size <= 65536
+          evidence = json.loads(path.read_text())
+          assert evidence['schema'] == 'devdrop-peer-simulation-evidence/v1'
+          assert evidence['simulator_only'] is True
+          assert evidence['transport'] == 'fixture-artifact-relay'
+          assert evidence['production_transport'] is False and evidence['direct_peer_tcp'] is False
+          summary = {key: evidence[key] for key in ('schema', 'phase', 'simulator_only', 'transport', 'production_transport', 'direct_peer_tcp')}
+          assert re.fullmatch(r'[A-Za-z0-9 _./:-]{1,64}', summary['phase'])
+          for key in ('offer_digest', 'reply_digest'):
+              if key in evidence:
+                  assert re.fullmatch(r'(?:blake3:)?[0-9a-f]{64}', evidence[key])
+                  summary[key] = evidence[key]
+          assert evidence['checks'] and len(evidence['checks']) <= 100
+          summary['checks'] = []
+          for check in evidence['checks']:
+              assert check['passed'] is True
+              assert re.fullmatch(r'[A-Za-z0-9 _./:-]{1,128}', check['name'])
+              summary['checks'].append({'name': check['name'], 'passed': True})
+          print('PEER_VM_SCENARIO_EVIDENCE=' + json.dumps(summary, sort_keys=True))
+          PY
+      - name: Save independent fixture and runtime verification
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: peer-vm-verification-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/verification/
+          if-no-files-found: error
+          include-hidden-files: false
+          retention-days: 7
