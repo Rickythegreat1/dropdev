@@ -104,6 +104,9 @@ impl Engine {
             return Err(err("Choose an empty directory for new DevDrop metadata."));
         }
         io(fs::create_dir_all(&state))?;
+        // Compare metadata roots using the same canonical representation as project
+        // roots, including Windows verbatim drive prefixes.
+        let state = io(fs::canonicalize(&state))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1569,6 +1572,8 @@ mod tests {
         assert!(e
             .register("bad", w.source.parent().unwrap(), &w.target)
             .is_err());
+        let nested_state = Engine::open(&w.source.join("metadata")).unwrap();
+        assert!(nested_state.register("bad", &w.source, &w.target).is_err());
         for path in [
             "../outside",
             "/absolute",
