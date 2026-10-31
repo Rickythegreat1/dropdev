@@ -2,18 +2,7 @@ name: Package DevDrop draft
 
 on:
   workflow_call:
-    inputs:
-      create_draft_release:
-        type: boolean
-        required: false
-        default: false
   workflow_dispatch:
-    inputs:
-      create_draft_release:
-        description: Create an unpublished draft release from the verified artifacts
-        type: boolean
-        required: true
-        default: false
 
 permissions:
   contents: read
@@ -83,25 +72,3 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-  draft:
-    name: Create unpublished release draft
-    if: inputs.create_draft_release
-    needs: package
-    runs-on: ubuntu-22.04
-    timeout-minutes: 15
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          pattern: devdrop-*
-          path: release-artifacts
-      - name: Create a draft only
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          version="$(node -p "require('./package.json').version")"
-          tag="v${version}"
-          gh release create "$tag" --draft --target "$GITHUB_SHA" --title "DevDrop ${version}" --notes-file docs/release-notes.md
-          find release-artifacts -type f -exec gh release upload "$tag" '{}' \;

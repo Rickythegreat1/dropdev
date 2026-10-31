@@ -167,5 +167,6 @@
 Delivery update: Git source push succeeded. Draft PR creation was denied by
 automatic approval review for lack of explicit user PR-publication permission;
 no retry or workaround was attempted. CI is enabled on codex branches and calls
-unsigned platform packaging on public-repository pushes without creating a
-release. Exact remote results are recorded with the portable handoff artifact.
+unsigned artifact-only packaging on public-repository pushes. A first remote
+workflow validation failure was corrected by moving draft publication into a
+separate manual workflow with its own write permission. Exact remote results are recorded with the portable handoff artifact.

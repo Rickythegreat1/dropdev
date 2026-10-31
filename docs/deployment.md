@@ -33,9 +33,8 @@ this workflow does not establish that it has run.
 Run the **Package DevDrop draft** workflow manually on the reviewed branch. It
 tests and builds Linux, Windows, and macOS installers plus the CLI, observer
 daemon, and read-only MCP executable. Each artifact includes SHA-256 checksums.
-The default run uploads workflow artifacts only. The optional
-`create_draft_release` input creates an unpublished draft for the package
-version. It never publishes or approves a release.
+The default run uploads workflow artifacts only. The separate manual **Create unpublished DevDrop draft** workflow creates an
+unpublished draft for the package version after its packaging job succeeds. It never publishes or approves a release.
 
 Before publishing a draft, verify installer startup and the disposable-two-folder
 workflow on each target operating system. Installers are unsigned until the
@@ -126,7 +125,13 @@ created and the denied operation was not retried through another route.
 The parent must resolve that approval before opening the PR.
 
 CI also runs for the `codex/**` review branches. On public-repository pushes it
-calls the platform packaging workflow with draft-release creation disabled, so
+calls the artifact-only platform packaging workflow, so
 Windows/macOS/Linux binaries can be verified without publishing or approving a
 release. No paid runner or signing credential is configured. Read the actual
 workflow result before describing any OS artifact as passed.
+
+The first review-branch Actions run failed workflow validation before executing
+jobs because a skipped draft-release job still requested write permissions from
+a read-only reusable-workflow caller. Draft publication was split into its own
+manual workflow; the reused packaging workflow now requests read-only access.
+The initial failed run is `41242515367`; follow the latest branch run for checks.
