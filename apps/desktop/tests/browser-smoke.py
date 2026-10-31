@@ -1,0 +1,38 @@
+from playwright.sync_api import sync_playwright
+import json
+import os
+with sync_playwright() as p:
+ browser=p.chromium.launch(executable_path=os.environ.get('DEVDROP_CHROMIUM', '/usr/bin/chromium'), headless=True, args=['--no-sandbox'])
+ page=browser.new_page(viewport={'width':1440,'height':1000}, device_scale_factor=1)
+ errors=[]
+ page.on('pageerror',lambda e: errors.append(str(e)))
+ page.goto(os.environ.get('DEVDROP_TEST_URL', 'http://127.0.0.1:1421'),wait_until='networkidle')
+ page.get_by_role('heading',name='Field notes',exact=True).wait_for()
+ page.screenshot(path='/tmp/devdrop-desktop.png',full_page=True)
+ page.get_by_role('button',name='Scan & preview changes').click()
+ apply=page.get_by_role('button',name='Apply to virtual replica')
+ assert apply.is_disabled()
+ page.get_by_role('checkbox').check()
+ apply.dblclick()
+ page.get_by_role('status').wait_for()
+ assert page.get_by_text('Virtual replica updated. No device files were accessed.').is_visible()
+ page.reload(wait_until='networkidle')
+ page.get_by_role('button',name='Activity & recovery',exact=True).click()
+ page.get_by_role('button',name='Preview recovery').first.click()
+ assert page.get_by_text('delete · tombstone').count()==2
+ page.get_by_role('checkbox').check()
+ page.get_by_role('button',name='Apply to virtual replica').click()
+ page.get_by_role('status').wait_for()
+ page.get_by_role('button',name='Overview',exact=True).click()
+ page.get_by_role('button',name='Simulate conflict').click()
+ page.get_by_role('button',name='Scan & preview changes').click()
+ assert page.get_by_role('checkbox').is_disabled()
+ page.get_by_role('button',name='Conflicts',exact=True).click()
+ page.screenshot(path='/tmp/devdrop-conflicts.png',full_page=True)
+ page.set_viewport_size({'width':390,'height':844})
+ page.get_by_role('button',name='Overview',exact=True).click()
+ page.screenshot(path='/tmp/devdrop-mobile.png',full_page=True)
+ assert page.evaluate('document.documentElement.scrollWidth <= window.innerWidth')
+ assert errors==[], errors
+ print(json.dumps({'passed':['preview approval gating','repeated click apply','receipt truthfulness','reload persistence','recovery preview and approved rollback','conflict blocks apply','390px layout no horizontal overflow','no browser runtime errors'],'screenshots':['/tmp/devdrop-desktop.png','/tmp/devdrop-conflicts.png','/tmp/devdrop-mobile.png']}))
+ browser.close()

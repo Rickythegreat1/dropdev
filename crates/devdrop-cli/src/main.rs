@@ -16,6 +16,14 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Use durable local two-folder sync. Fixture commands remain separate.
+    Local {
+        /// Private local state directory, outside both registered roots.
+        #[arg(long)]
+        state_dir: std::path::PathBuf,
+        #[command(subcommand)]
+        command: LocalCommand,
+    },
     /// Initialize local DevDrop metadata contracts without writing files.
     Init,
     /// Print workspace readiness.
@@ -80,6 +88,66 @@ enum Commands {
     /// Legacy redacted handoff preview.
     #[command(hide = true)]
     Handoff,
+}
+
+#[derive(Debug, Subcommand)]
+enum LocalCommand {
+    /// List registered folder pairs and recorded plans/receipts.
+    List,
+    /// Register two existing roots. Does not sync workspace files.
+    Register {
+        name: String,
+        source: String,
+        target: String,
+    },
+    /// Reconcile both roots and persist an exact dry-run plan.
+    Preview { pair_id: String },
+    /// Apply one recorded plan after separate review and explicit approval.
+    Apply {
+        plan_id: String,
+        /// Must exactly match the reviewed plan ID.
+        #[arg(long)]
+        approve: String,
+    },
+    /// Prepare an undo plan. Review it, then apply its new plan ID.
+    RollbackPreview { plan_id: String },
+    /// Preserve a conflict with an explicit resolution plan; apply separately.
+    ResolvePreview {
+        pair_id: String,
+        path: String,
+        #[arg(value_parser = ["source", "target", "both"])]
+        choice: String,
+    },
+    /// Read the durable event log and recovery receipts.
+    Events,
+    /// Emit a redacted agent handoff without source text or env values.
+    Handoff { pair_id: String },
+}
+
+fn local_request(command: &LocalCommand) -> serde_json::Value {
+    use serde_json::json;
+    match command {
+        LocalCommand::List => json!({"action":"list"}),
+        LocalCommand::Register {
+            name,
+            source,
+            target,
+        } => json!({"action":"register", "name":name, "source":source, "target":target}),
+        LocalCommand::Preview { pair_id } => json!({"action":"preview", "pair_id":pair_id}),
+        LocalCommand::Apply { plan_id, approve } => {
+            json!({"action":"apply", "plan_id":plan_id, "approval":approve})
+        }
+        LocalCommand::RollbackPreview { plan_id } => {
+            json!({"action":"rollback_preview", "plan_id":plan_id})
+        }
+        LocalCommand::ResolvePreview {
+            pair_id,
+            path,
+            choice,
+        } => json!({"action":"resolve_preview", "pair_id":pair_id, "path":path, "choice":choice}),
+        LocalCommand::Events => json!({"action":"events"}),
+        LocalCommand::Handoff { pair_id } => json!({"action":"handoff", "pair_id":pair_id}),
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -225,6 +293,10 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn render(command: Commands) -> anyhow::Result<(String, i32)> {
+    if let Commands::Local { state_dir, command } = &command {
+        let result = devdrop_core::local::dispatch(state_dir, local_request(command))?;
+        return Ok((serde_json::to_string_pretty(&result)?, 0));
+    }
     let json = matches!(command, Commands::Doctor { json: true });
     let report = handle_command(command);
     let exit_code = report.exit_code;
@@ -238,6 +310,9 @@ fn render(command: Commands) -> anyhow::Result<(String, i32)> {
 
 fn handle_command(command: Commands) -> CliReport {
     match command {
+        Commands::Local { .. } => {
+            unreachable!("durable commands are handled before fixture rendering")
+        }
         Commands::Init => init_report(),
         Commands::Doctor { .. } => doctor_report(),
         Commands::Scan { path } => scenario_report("scan", scenario_from_path(path.as_deref())),

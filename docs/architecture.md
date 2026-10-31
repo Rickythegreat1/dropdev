@@ -10,6 +10,30 @@ Dangerous behavior is gated. Architecture diagrams describe intended flow, not
 permission to delete, overwrite, move, hydrate, or sync user files without
 dry-run, explicit approval, rollback notes, event-log coverage, and tests.
 
+## Current local runtime (2026-10-31)
+
+`devdrop-core/src/local.rs` now implements the durable local content-sync beta.
+It owns a SQLite WAL registry, full-sync metadata, verified eligible-content CAS,
+three-way directional previews, exact-plan approvals, tombstones, retained
+outgoing inodes and recovery plans. CLI `local` and Tauri `local_command` call
+this engine directly. Native IPC requires the local application context; the web
+build has no filesystem mutation API. No network daemon receives apply commands.
+MCP uses actual bounded stdio JSON-RPC and exposes reduced metadata/preview tools.
+
+Source → replica pairs use mutually constrained ignore policies. Divergent target
+content is preserved as conflict evidence. Replace/delete first quarantine the
+actual outgoing inode and incoming files are installed without clobbering a
+concurrently recreated path. Completion advances the baseline only after fresh
+verification; recovery refuses to overwrite newer work. A writer lock serializes
+CLI/native/MCP access and SQLite FULL/WAL records transitions. Unix fsyncs object,
+state and changed directories. Retained backup directories are excluded from sync.
+
+The following foundation sections retain historical contracts for the observer
+daemon, legacy fixture commands and hydration simulation. Statements that apply
+is unavailable refer to those original surfaces, not the new `local` runtime.
+Network transport, automatic agent execution, environment provisioning and OS
+installer validation remain outside the delivered local beta.
+
 ## Rust Crates
 
 | Crate | Responsibility | Hard boundary |

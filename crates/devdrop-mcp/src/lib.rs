@@ -1,6 +1,9 @@
 use devdrop_core::{doctor_report_text, SafetyMode, SyncPreview};
 use serde::{Deserialize, Serialize};
 
+/// JSON-RPC stdio transport for the durable local runtime.
+pub mod protocol;
+
 pub const STDIO_SCAFFOLD_NOTE: &str =
     "JSON-over-STDIO scaffold for local Slice 0/1 testing; not a complete MCP protocol implementation.";
 

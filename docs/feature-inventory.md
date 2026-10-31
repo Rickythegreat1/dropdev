@@ -119,21 +119,29 @@ explicit approval, rollback notes, event log coverage, and tests.
 | Anti-slop rubric | Team needs design quality gate. | Rubric rejects generic AI dashboard patterns. | UI PR includes rubric result. | Red-team checklist. | Rubric ignored. | Slop becomes system. | None direct. | docs/design-redteam-rubric.md. | read-only |
 | Red-team loops | Safety and design need adversarial review. | Run UX/aesthetic/security reviews based on touched surface. | Loop log records result. | Loop-log audit. | Review theater. | Same visual drift. | Missed leak/destructive path. | docs, tools/design-redteam. | read-only |
 
-## Missing Feature Audit
+## Current implementation audit (2026-10-31)
 
-- No durable SQLite registry or WAL checkpoint implementation yet.
-- No real workspace scanner enforcing ignore/env/Git policies yet.
-- No CAS writer or object verification beyond contracts yet.
-- No event log persistence or replay yet.
-- No two-folder sync simulation apply path yet.
-- No LAN/mock remote adapter implementation yet.
-- No real live-workspace hydration apply path yet; current apply behavior is
-  sandbox-only fixture simulation.
-- No conflict resolution apply path yet.
-- No tombstone restore/apply path yet.
-- No agent workspace creation implementation yet.
-- No MCP server runtime yet.
-- No screenshot-based UX/aesthetic eval automation yet.
+Implemented live in `devdrop_core::local`: durable SQLite registry/WAL, bounded
+regular-file scans, verified CAS, persisted previews/events, approved two-folder
+copy/replace/delete, conflict preservation/resolution, tombstones, rollback and
+interruption recovery. CLI `local` and native Tauri routes share that engine.
+MCP stdio now implements initialization/discovery/calls with redacted previews.
+The browser app runs a clearly labelled virtual-data demo. CI and manual draft
+packaging workflows are present; creating them is not evidence they ran remotely.
+
+Remaining beyond this local content-sync beta:
+
+- Remote-machine transport, pairing/identity and cloud-object adapters.
+- Live hydration outside the existing bounded sandbox simulation.
+- Env key/runtime availability inventory and automated environment provisioning.
+- Task-scoped agent workspace execution; handoff remains a redacted contract.
+- File metadata/executable-bit synchronization, symlinks, empty directories.
+- OS installer validation, signing and physical power-loss testing.
+- Verified hosting publication (supported Sites source helper missing here).
+
+The original inventory tables describe product intent. They are not a claim that
+all intended features are implemented. See README and deployment record for exact
+commands and verification status.
 
 ## Dangerous Assumptions
 

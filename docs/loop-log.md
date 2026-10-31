@@ -118,3 +118,48 @@
   state, preview evidence, dirty-local warning, and CLI-only apply language
   without generic dashboard cards, fake glass, vague pills, or decorative
   gradients.
+
+## 2026-10-31 — Durable local sync and delivery candidate
+
+1. **Task and scope.** Deliver a working local two-folder content-sync beta and
+   prepare native/hosted delivery. The separate `Rickythegreat1/dropdev` checkout
+   started at `0aae71ed246e75f5a8f78e977d24f1153b40f639`. The portfolio checkout
+   was neither edited nor deployed. Files touched: `devdrop-core/local`, CLI/MCP
+   adapters/tests, desktop routes/data/native bridge/tests/icons, lockfiles,
+   CI/release workflows, browser packager and behavior/delivery documentation.
+2. **Risk and gates.** High risk: filesystem writes, rollback, SQLite/CAS and
+   secret boundaries. Registration and preview precede exact-plan approval;
+   fresh scans/revision checks precede apply. Mutations use generated disposable
+   folders in tests. No real project folders or secrets were synchronized.
+3. **Implementation.** SQLite FULL/WAL and writer lock; verified eligible CAS;
+   directional three-way content plans; conflicts with source/target/both
+   resolution previews; tombstones; outgoing-inode quarantine; no-clobber
+   install; interruption state and separately approved undo; redacted stdio MCP;
+   native IPC; ten desktop routes and explicit virtual-data browser demo.
+4. **Verification.** Final workspace run: 100 Rust tests passed (14 CLI legacy,
+   2 CLI process workflows, 45 core, 9 independent safety regressions, 21 daemon,
+   8 MCP library/protocol, 1 MCP process transport). Desktop: 12 tests, TypeScript
+   checks and production build passed. Real Chromium virtual-workflow/mobile
+   smoke passed. Rust all-target check and formatting passed. Portable static
+   packaging checks passed. Native Linux check reached glib-sys and failed due
+   to absent glib/GTK/WebKit development packages. Official apt installation
+   failed with permission errors; sudo is unavailable. Windows/macOS packaging,
+   clean-machine installer startup, signing, physical power loss and live
+   hosted health were never run here.
+5. **Red-team findings.** Independent review reproduced and fixed last-moment
+   editor overwrite, ignored-file deletion, state-child symlink redirection,
+   nested Git dirty-check bypass, Git filter execution and unsafe/nested ignore
+   policy parsing. Added targeted regressions and retained quarantine evidence
+   in native activity. UX/aesthetic review found evidence/approval separation
+   and truthful demo labels; see `src/critique/mvp-redteam.md` and
+   `docs/runtime-review.md`. No identified local-sync regression remains open.
+6. **Closeout and remaining work.** Source is a reviewed beta; full remote
+   machine transport, file metadata sync, env/runtime inventory/provisioning,
+   live hydration and automated agent workspace execution remain unimplemented.
+   The safe hosted component is only the disposable demo/guide. Owner-private
+   Site `appgprj_6ae6574f8b948191bd7acb0f16a01fdf` exists, version 0,
+   no deployment/live URL; missing required Sites source helper blocks push and
+   publication. No costs, persistent credentials, Docker, signing identities,
+   public filesystem APIs or PR approvals were created. Draft PR/portable bundle
+   carry reviewable source and exact verification; release workflows need actual
+   OS runs before installer claims.

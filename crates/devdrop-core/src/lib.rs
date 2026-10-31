@@ -1,8 +1,8 @@
 //! Core DevDrop contracts for local-first workspace state.
 //!
-//! This crate owns pure data models, hashing, validation, and dry-run planning
-//! contracts. It does not run watchers, mutate files, write SQLite metadata,
-//! apply hydration, delete files, resolve conflicts, or mutate Git state.
+//! This crate contains the original model contracts and sandbox hydration plus
+//! `local`, the durable approval-gated filesystem runtime. It never mutates Git
+//! state or exposes a remotely callable write service.
 
 pub mod conflict;
 pub mod content_hash;
@@ -11,6 +11,7 @@ pub mod error;
 pub mod event_log;
 pub mod hydration;
 pub mod ignore_policy;
+pub mod local;
 pub mod machine;
 pub mod manifest;
 pub mod object_id;
