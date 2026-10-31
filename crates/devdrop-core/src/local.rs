@@ -979,6 +979,11 @@ fn reject_symlinks(path: &Path) -> Result<()> {
     let mut p = PathBuf::new();
     for component in path.components() {
         p.push(component);
+        // A Windows drive/verbatim prefix is not a complete path until its
+        // RootDir component is appended. Inspecting `\\?\C:` alone is invalid.
+        if matches!(component, Component::Prefix(_)) {
+            continue;
+        }
         match fs::symlink_metadata(&p) {
             Ok(m) if m.file_type().is_symlink() => return Err(err("Symlink paths are blocked.")),
             Ok(_) => {}

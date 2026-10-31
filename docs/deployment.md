@@ -147,3 +147,9 @@ a nested-worktree refusal due to external filters is accepted as a fail-closed
 result, without executing those filters. Disposable fixture roots use their
 canonical temporary-directory paths so macOS `/var` aliases do not conflict with
 the runtime's deliberate symlink-path refusal.
+
+Windows CI then caught a runtime path-prefix bug: checking symlink metadata on a
+bare canonical drive prefix is invalid on Windows. Prefix components are now
+accumulated before metadata checks begin at the full drive root; checks of every
+real root/ancestor component remain enforced. The real CLI process tests are the
+regression gate for this Windows-specific failure.
