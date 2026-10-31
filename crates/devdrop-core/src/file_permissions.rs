@@ -68,8 +68,10 @@ pub fn make_disposable_test_directory_private(path: &std::path::Path) -> Result<
 #[cfg(unix)]
 mod platform {
     use super::*;
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     #[cfg(target_os = "macos")]
+    use std::os::macos::fs::MetadataExt as _;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     use std::os::unix::io::AsRawFd;
     use xattr::FileExt;
 
@@ -91,6 +93,12 @@ mod platform {
         if mode & 0o7000 != 0 {
             return Err("Special permission bits are unsupported; setuid, setgid and sticky entries are blocked.");
         }
+        #[cfg(target_os = "macos")]
+        if metadata.st_flags() != 0 {
+            return Err("BSD file flags are unsupported; locked, append-only and other flagged entries are blocked.");
+        }
+        #[cfg(target_os = "linux")]
+        inspect_linux_flags(file)?;
         if file
             .list_xattr()
             .map_err(|_| {
@@ -118,6 +126,50 @@ mod platform {
         .to_hex()
         .to_string();
         Ok((mode & 0o777, guard))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn supported_linux_flags(flags: u32) -> bool {
+        // Linux uapi/linux/fs.h: these describe directory indexing / on-disk
+        // extent storage, not access rights. They need not survive a copy and
+        // may change as directory contents grow. All other flags fail closed,
+        // including IMMUTABLE, APPEND, ENCRYPT, VERITY, DAX and unknown bits.
+        const STORAGE_LAYOUT_ONLY: u32 = 0x0000_1000 | 0x0008_0000;
+        flags & !STORAGE_LAYOUT_ONLY == 0
+    }
+
+    #[cfg(target_os = "linux")]
+    fn inspect_linux_flags(file: &File) -> Result<()> {
+        let mut flags: libc::c_int = 0;
+        // SAFETY: GETFLAGS is a read-only query against the already opened
+        // descriptor. Linux expects a writable int output (not a path).
+        let result = unsafe { libc::ioctl(file.as_raw_fd(), libc::FS_IOC_GETFLAGS, &mut flags) };
+        if result != 0 {
+            return Err("Filesystem flag inspection failed; permission preservation is blocked.");
+        }
+        if !supported_linux_flags(flags as u32) {
+            return Err("Unsupported filesystem flags; immutable, append-only and other flagged entries are blocked.");
+        }
+        Ok(())
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    mod flag_tests {
+        use super::*;
+
+        #[test]
+        fn access_flags_and_unknown_bits_are_refused_without_setting_them() {
+            assert!(supported_linux_flags(0));
+            assert!(supported_linux_flags(0x0008_1000));
+            for flag in [0x10, 0x20, 0x800, 0x100000, 0x2000000, 0x80000000] {
+                assert!(!supported_linux_flags(flag));
+                assert!(!supported_linux_flags(flag | 0x0008_1000));
+            }
+            let temp = tempfile::tempdir().unwrap();
+            inspect_linux_flags(&File::open(temp.path()).unwrap()).unwrap();
+            let file = File::create(temp.path().join("generated-flag-fixture")).unwrap();
+            inspect_linux_flags(&file).unwrap();
+        }
     }
     pub fn inspect_file(file: &File) -> Result<AccessMetadata> {
         let (mode, guard) = inspect(file, false)?;
@@ -165,42 +217,48 @@ mod platform {
 
     #[cfg(target_os = "macos")]
     fn reject_macos_acl(file: &File) -> Result<()> {
-        use std::{ffi::c_void, ptr};
-        // Apple sys/acl.h: ACL_TYPE_EXTENDED=0x100, ACL_FIRST_ENTRY=0.
+        use std::ffi::c_void;
+        // Apple FILESEC_ACL=5. Presence itself is unsupported, even for an
+        // empty ACE list, because inheritance flags are outside this policy.
         extern "C" {
-            fn acl_get_fd_np(fd: libc::c_int, acl_type: libc::c_int) -> *mut c_void;
-            fn acl_get_entry(
-                acl: *mut c_void,
-                entry: libc::c_int,
-                out: *mut *mut c_void,
+            fn filesec_init() -> *mut c_void;
+            fn filesec_free(filesec: *mut c_void);
+            #[cfg_attr(
+                any(target_arch = "x86", target_arch = "x86_64"),
+                link_name = "fstatx_np$INODE64"
+            )]
+            fn fstatx_np(
+                fd: libc::c_int,
+                stat: *mut libc::stat,
+                filesec: *mut c_void,
             ) -> libc::c_int;
-            fn acl_valid(acl: *mut c_void) -> libc::c_int;
-            fn acl_free(acl: *mut c_void) -> libc::c_int;
+            fn filesec_query_property(
+                filesec: *mut c_void,
+                property: libc::c_int,
+                present: *mut libc::c_int,
+            ) -> libc::c_int;
         }
-        // SAFETY: the ACL object is obtained for this open descriptor, queried while
-        // alive and freed exactly once. No ACL entry contents are read or exposed.
+        // SAFETY: the native filesec object is live for these fd-bound calls and
+        // freed exactly once. The uninitialized stat output is never read.
         unsafe {
-            let acl = acl_get_fd_np(file.as_raw_fd(), 0x100);
-            if acl.is_null() {
+            let filesec = filesec_init();
+            if filesec.is_null() {
                 return Err("Native ACL inspection failed; permission preservation is blocked.");
             }
-            let valid = acl_valid(acl);
-            let mut entry = ptr::null_mut();
-            let result = if valid == 0 {
-                acl_get_entry(acl, 0, &mut entry)
+            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+            let inspected = fstatx_np(file.as_raw_fd(), stat.as_mut_ptr(), filesec);
+            let mut present = 0;
+            let queried = if inspected == 0 {
+                filesec_query_property(filesec, 5, &mut present)
             } else {
-                -2
+                -1
             };
-            let errno = std::io::Error::last_os_error().raw_os_error();
-            acl_free(acl);
-            if valid != 0 {
-                return Err("Native ACL metadata is invalid or unsupported.");
-            }
-            if result == 0 {
-                return Err("Extended ACLs are unsupported; preserve them outside this disposable-copy beta.");
-            }
-            if result != -1 || errno != Some(libc::EINVAL) {
+            filesec_free(filesec);
+            if inspected != 0 || queried != 0 {
                 return Err("Native ACL inspection failed; permission preservation is blocked.");
+            }
+            if present != 0 {
+                return Err("Extended ACLs are unsupported; preserve them outside this disposable-copy beta.");
             }
         }
         Ok(())
@@ -294,14 +352,33 @@ mod platform {
             Ok(buffer)
         }
     }
-    fn identity() -> Result<(Vec<u8>, Vec<u8>)> {
+    struct Identity {
+        user: Vec<u8>,
+        creation_owner: Vec<u8>,
+        primary_group: Vec<u8>,
+    }
+    fn identity() -> Result<Identity> {
         unsafe {
             let user = token_information(TokenUser)?;
+            let owner = token_information(TokenOwner)?;
             let group = token_information(TokenPrimaryGroup)?;
-            Ok((
-                sid_bytes((*(user.as_ptr().cast::<TOKEN_USER>())).User.Sid)?,
-                sid_bytes((*(group.as_ptr().cast::<TOKEN_PRIMARY_GROUP>())).PrimaryGroup)?,
-            ))
+            let identity = Identity {
+                user: sid_bytes((*(user.as_ptr().cast::<TOKEN_USER>())).User.Sid)?,
+                creation_owner: sid_bytes((*(owner.as_ptr().cast::<TOKEN_OWNER>())).Owner)?,
+                primary_group: sid_bytes(
+                    (*(group.as_ptr().cast::<TOKEN_PRIMARY_GROUP>())).PrimaryGroup,
+                )?,
+            };
+            // Ownership itself can grant WRITE_DAC. Do not admit a token's
+            // arbitrary default-owner group outside the canonical private set.
+            if identity.creation_owner != identity.user
+                && identity.creation_owner != known_sid(WinBuiltinAdministratorsSid)?
+            {
+                return Err(
+                    "Windows default creation owner is outside the supported private principals.",
+                );
+            }
+            Ok(identity)
         }
     }
     fn known_sid(kind: WELL_KNOWN_SID_TYPE) -> Result<Vec<u8>> {
@@ -383,7 +460,11 @@ mod platform {
     /// Require the same effective grants on source, destination and inherited files:
     /// full control to exactly the current user, SYSTEM and Administrators.
     fn private_security(file: &File, directory: bool) -> Result<String> {
-        let (user, primary_group) = identity()?;
+        let Identity {
+            user,
+            creation_owner,
+            primary_group,
+        } = identity()?;
         let system = known_sid(WinLocalSystemSid)?;
         let admins = known_sid(WinBuiltinAdministratorsSid)?;
         let creator = known_sid(WinCreatorOwnerSid)?;
@@ -408,8 +489,8 @@ mod platform {
             }
             let owner = sid_bytes(owner)?;
             let group = sid_bytes(group)?;
-            if owner != user || group != primary_group {
-                return Err("Foreign Windows ownership/group is unsupported; use a current-user disposable copy.");
+            if owner != creation_owner || group != primary_group {
+                return Err("Windows ownership/group differs from this process's creation defaults; use a disposable copy created by this process.");
             }
             if dacl.is_null()
                 || IsValidAcl(dacl) == 0
@@ -643,7 +724,11 @@ mod platform {
             return Err("Private fixture provisioning requires a new empty non-symlink directory.");
         }
         unsafe {
-            let (user, _) = identity()?;
+            let Identity {
+                user,
+                creation_owner,
+                primary_group,
+            } = identity()?;
             let mut sid_string = ptr::null_mut();
             if ConvertSidToStringSidW(user.as_ptr() as PSID, &mut sid_string) == 0 {
                 return Err("Cannot format generated Windows fixture identity.");
@@ -693,9 +778,12 @@ mod platform {
             if SetSecurityInfo(
                 handle(&file),
                 SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-                ptr::null_mut(),
-                ptr::null_mut(),
+                OWNER_SECURITY_INFORMATION
+                    | GROUP_SECURITY_INFORMATION
+                    | DACL_SECURITY_INFORMATION
+                    | PROTECTED_DACL_SECURITY_INFORMATION,
+                creation_owner.as_ptr() as PSID,
+                primary_group.as_ptr() as PSID,
                 dacl,
                 ptr::null(),
             ) != 0
@@ -731,6 +819,46 @@ mod platform {
             inspect_directory(&file)?;
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn elevated_creation_owner_admits_new_files_and_rejects_user_owned_sources() {
+            let identity = identity().unwrap();
+            let temp = tempfile::tempdir().unwrap();
+            make_disposable_test_directory_private(temp.path()).unwrap();
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .access_mode(FILE_GENERIC_READ | FILE_GENERIC_WRITE | WRITE_OWNER)
+                .open(temp.path().join("generated-owner-fixture"))
+                .unwrap();
+            // Default-created children must satisfy the same ownership policy
+            // as source/destination files; no owner transfer is part of sync.
+            inspect_file(&file).unwrap();
+            if identity.creation_owner != identity.user {
+                // Taking ownership as the current token user needs no restored
+                // privilege; this touches only the generated fixture inode.
+                let result = unsafe {
+                    SetSecurityInfo(
+                        handle(&file),
+                        SE_FILE_OBJECT,
+                        OWNER_SECURITY_INFORMATION,
+                        identity.user.as_ptr() as PSID,
+                        ptr::null_mut(),
+                        ptr::null(),
+                        ptr::null(),
+                    )
+                };
+                assert_eq!(result, 0);
+                let error = inspect_file(&file).unwrap_err();
+                assert!(error.contains("creation defaults"), "{error}");
+            }
+        }
     }
 }
 
@@ -813,8 +941,12 @@ mod tests {
     }
     #[cfg(target_os = "macos")]
     #[test]
-    fn macos_native_acl_is_rejected_without_reading_entries() {
+    fn macos_plain_files_and_directories_are_admitted_but_native_acls_are_blocked() {
         let temp = tempfile::tempdir().unwrap();
+        let directory_path = temp.path().join("plain-directory");
+        std::fs::create_dir(&directory_path).unwrap();
+        let directory = File::open(&directory_path).unwrap();
+        inspect_directory(&directory).unwrap();
         let path = temp.path().join("acl-fixture");
         std::fs::write(&path, b"generated native ACL fixture").unwrap();
         let file = File::open(&path).unwrap();
@@ -826,6 +958,13 @@ mod tests {
             .unwrap();
         assert!(result.status.success());
         assert!(inspect_file(&file).is_err());
+        let result = std::process::Command::new("chmod")
+            .args(["+a", "everyone allow list"])
+            .arg(&directory_path)
+            .output()
+            .unwrap();
+        assert!(result.status.success());
+        assert!(inspect_directory(&directory).is_err());
     }
     #[cfg(windows)]
     #[test]

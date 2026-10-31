@@ -14,6 +14,19 @@ Setuid, setgid and sticky bits are rejected. Extended attributes and extended
 ACLs are rejected, including default directory ACLs. Linux ACLs are detected via
 fd-based attribute enumeration; macOS additionally queries its native extended
 ACL through the open descriptor. Inspection errors fail closed.
+The macOS check requires a successful `fstatx_np` and a successful
+`filesec_query_property(FILESEC_ACL)` query: an absent ACL property is admitted;
+an inspection failure is not interpreted as absence. Any present extended ACL,
+including an empty ACL with possible inheritance flags, is refused. This avoids the ambiguity
+of `acl_get_fd_np`, which can return null both for an absent ACL and for errors.
+macOS BSD file flags must be zero; immutable/Finder-locked, append-only and
+other flagged files/directories are refused. Linux additionally requires a
+successful descriptor-based `FS_IOC_GETFLAGS` query. Only the extent-storage
+and directory-index layout bits are admitted; all other flags, including
+immutable, append-only, encryption, verity and unknown flags, are refused.
+No filesystem flags are changed or privileges enabled. Unsupported-filesystem
+query errors block inspection. The accepted layout bits do not affect access
+and may change as directory contents grow, so they are not access-guard inputs.
 
 The guard includes device/inode identity, owner/group and permission bits. It
 excludes timestamps and link count so retaining an inode through rename/hardlink
@@ -24,8 +37,14 @@ would leave a window in which a different user could retain an open read handle.
 ## Windows
 
 The supported file flag is read-only. Unix execute bits have no equivalent in
-this policy. Windows file owner and primary group must match the current
-process token. DevDrop does not assign owner/group or copy arbitrary DACLs.
+this policy. Windows file owner must match the current process token's default
+creation owner (`TokenOwner`); its group must match `TokenPrimaryGroup`. This
+admits either ordinary user-default creation or elevated Administrator-default
+creation without changing ownership. The creation owner must itself be the
+token user or BUILTIN Administrators; arbitrary default-owner groups are
+rejected. A user-owned file scanned by a process whose default owner is
+Administrators is refused. DevDrop does not assign owner/group in production
+or copy arbitrary DACLs.
 
 The accepted DACL has full control for exactly the current user, SYSTEM and
 Administrators, with no additional access principals or deny/object/partial ACEs.
@@ -49,7 +68,9 @@ extended-metadata preservation. Files that depend on unqueried auditing or other
 unsupported security policy must stay outside this beta. Windows tests use only
 new empty generated directories, explicitly provisioned with the accepted private
 DACL and inheritable medium integrity policy; production code does not rewrite a
-user directory's ACL to make it pass.
+user directory's ACL to make it pass. Fixture setup also assigns only that new,
+empty generated root's owner/group to the process creation owner/primary group.
+Its subsequently generated children use the unchanged token creation defaults.
 
 ## Replacement and rollback
 
@@ -69,6 +90,8 @@ because a backup exists.
 
 - [Microsoft GetSecurityInfo](https://learn.microsoft.com/en-us/windows/win32/api/aclapi/nf-aclapi-getsecurityinfo)
   documents handle-based owner/DACL queries and returned-buffer lifetime.
+- [Microsoft TOKEN_OWNER](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-token_owner)
+  defines the default owner assigned to newly created objects.
 - [Microsoft SECURITY_INFORMATION](https://learn.microsoft.com/en-us/windows/win32/secauthz/security-information)
   distinguishes ordinary `READ_CONTROL` access-policy queries from privileged
   full-SACL queries.
@@ -77,6 +100,11 @@ because a backup exists.
 - [Apple ACL API](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/acl_get_fd.3.html)
   and its [public header](https://raw.githubusercontent.com/apple-oss-distributions/Libc/main/include/sys/acl.h)
   define the native fd-based extended-ACL check.
+- Apple's [`fstatx_np` implementation](https://github.com/apple-oss-distributions/Libc/blob/main/sys/statx_np.c)
+  and [`filesec` implementation](https://github.com/apple-oss-distributions/Libc/blob/main/gen/filesec.c)
+  distinguish a successful query with no ACL property from inspection errors.
+- The [Linux UAPI flags](https://github.com/torvalds/linux/blob/master/include/uapi/linux/fs.h)
+  define the descriptor-based GETFLAGS request and inode flag bits.
 
 The module's Linux tests and Windows cross-target compilation are local checks;
 Windows/macOS runtime behavior requires the platform CI fixtures and remains

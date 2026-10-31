@@ -249,3 +249,26 @@ separate manual workflow with its own write permission. Exact remote results are
    evidence on recovery refusals. Same Library handoff will carry new source and
    final platform artifacts. No PR retry, new credentials, Docker, hosting route,
    real project mutation or paid resources were used.
+
+### Corrective native-platform validation pass
+
+The first permission CI run (`82256df`) passed Linux and exposed two platform
+assumptions: macOS no-ACL results were ambiguous through `acl_get_fd_np`, and
+elevated Windows creation ownership can differ from TokenUser. Before changing
+code, scope was limited to file_permissions.rs, permission documentation/review,
+and removal of an unused test helper. Risk remains high because these guards
+control file-access evidence. Tests require proven no-ACL admission, extended-ACL
+refusal, constrained TokenOwner matching, new default-owner files admitted, and
+mismatched ownership refused. No UI changes are required; previews keep the
+existing supported-flags and extra-consent flow. The correction uses successful
+fd-bound extended-stat/property queries and admits only an absent ACL property.
+Windows accepts creation ownership only when it is TokenUser or BUILTIN Admin,
+without changing production owners, tokens or DACL principals. Linux workspace
+tests, all-target checking, optimized builds and the real CLI mode/retained-inode
+proof pass. A final review additionally requires immutable/append flag detection;
+the final guard now refuses nonzero macOS BSD flags and requires successful Linux
+GETFLAGS with only extents/index layout bits. No flags were written or privileges
+enabled. The final local suite passed 123 Rust tests, all-target checks, optimized
+builds and generated-folder CLI copy/mode/widening/original-inode rollback proof;
+18 UI tests and Chromium checks remain valid because UI did not change in this
+correction. Native-platform results are recorded with the exact-commit handoff.

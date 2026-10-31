@@ -16,12 +16,17 @@ disposable or establish a filesystem sandbox.
 
 - Unix: preserve ordinary owner/group/other `rwx` bits. Refuse setuid, setgid,
   sticky bits, foreign ownership/group, extended attributes, ACLs, and failed
-  metadata inspection. File and directory guards pin device/inode identity,
+  metadata inspection. macOS rejects nonzero BSD file flags; Linux permits only
+  known storage-layout flags after a successful descriptor-bound query. File and directory guards pin device/inode identity,
   current ownership, and supported access metadata. They deliberately exclude
   timestamps and hard-link count, which change during normal reconciliation.
 - Windows: preserve read-only within a constrained private policy. Supported
-  files and directories require the current user's owner/group and effective
-  full-control grants to exactly the current user, SYSTEM, and Administrators.
+  files and directories require an owner equal to the process default creation
+  owner (`TokenOwner`) and group equal to `TokenPrimaryGroup`. The creation
+  owner must be `TokenUser` or BUILTIN Administrators; arbitrary owner groups
+  are refused. The DACL still grants effective full control to exactly
+  `TokenUser`, SYSTEM, and Administrators. Production never rewrites ownership,
+  groups, or ACLs to make a source fit this policy.
   Unsupported principals, partial/custom/deny/object ACEs, alternate streams,
   extended attributes, and unsupported filesystem attributes fail closed.
   Access-related SACL inspection accepts implicit/default medium `NO_WRITE_UP`
@@ -53,6 +58,7 @@ disposable or establish a filesystem sandbox.
 | Linux `cap_std::Dir` handles can use `O_PATH`; fd-based xattr checks then fail with `EBADF`. | Inspection reopens a readable directory descriptor through the captured capability. Ten initially failing permission tests subsequently passed without weakening inspection errors. |
 | A restored inode was validated early, but its identity was discarded at the installation boundary. | Restore revalidates retained metadata before linking and compares the installed full guard to that retained evidence. The substitution-at-install-boundary regression passes. |
 | A private-principal subset DACL could inherit a broader supported subset on Windows. | The Windows policy requires the exact effective current-user/SYSTEM/Administrators full-control set and constrained inheritance. This is a code-reviewed policy; native Windows verification remains pending. |
+| Elevated Windows creation can default to Administrators ownership rather than `TokenUser`, so accepting a user-owned source could fail only after quarantine. | The guard now requires actual ownership equal to the constrained `TokenOwner` creation default, with exact primary-group matching. A mismatched source is refused before mutation; no production ownership transfer or token change is introduced. This policy does not add a principal beyond the canonical full-control set. |
 | A public inherited Windows state/cache ACL could expose cached source content. | State, object-store directories, and existing metadata files are validated before content writes. New CAS files are protected and inspected before filling. Native Windows validation remains pending. |
 | A prepared incoming inode could otherwise be treated as its own recovery proof. | A durable `incoming_prepared` event records the actual guard before installation. Interruption recovery checks that evidence rather than deriving trust from current staging contents alone. |
 
@@ -62,12 +68,36 @@ through the opened handle before no-clobber installation. The private incoming
 inode is retained, avoiding deletion of a read-only temporary file and removing
 the originally proposed Windows post-install attribute-setting window.
 
-Unix metadata inspection uses opened descriptors. macOS has an ACL-specific
-native check in addition to xattr inspection; Apple's API retrieves an ACL for
-the opened descriptor. [Apple ACL descriptor API](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/acl_get_fd_np.3.html)
+Unix metadata inspection uses opened descriptors. The macOS check combines
+fd-bound extended stat with explicit ACL-property presence inspection.
+[Apple extended-stat implementation](https://github.com/apple-oss-distributions/Libc/blob/main/sys/statx_np.c),
+[Apple security-property implementation](https://github.com/apple-oss-distributions/Libc/blob/main/gen/filesec.c)
 Windows integrity/resource-policy queries use the documented `READ_CONTROL`
 query rights; full audit-SACL retrieval requires additional access and is outside
 this implementation's preservation scope. [Microsoft security information rights](https://learn.microsoft.com/en-us/windows/win32/secauthz/security-information)
+The Windows owner policy follows the token field that governs newly created
+objects, rather than assuming it always equals the user SID.
+[Microsoft default creation-owner definition](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-token_owner)
+
+## Filesystem flag finding: corrected
+
+BSD immutable/append flags and analogous Linux inode flags are separate from
+rwx, xattrs, and ACLs. Their earlier omission could have copied a locked but
+owner-writable source into an unlocked destination without changing its mode.
+The reviewed correction rejects any nonzero macOS `st_flags`. Linux now requires
+a successful descriptor-bound `FS_IOC_GETFLAGS` query and permits only directory
+indexing (`0x1000`) and extent storage (`0x80000`) bits; all other or unknown
+bits fail closed. No filesystem flags are changed and no privileges are added.
+The kernel query returns a 32-bit flag value. [Linux flag-query implementation](https://github.com/torvalds/linux/blob/master/fs/file_attr.c)
+
+The permitted bits describe storage layout, rather than access rights, and may
+change during ordinary directory growth. They are intentionally excluded from
+identity/access guards. The module regression checks rejected flag masks and
+queries ordinary generated file/directory handles; it does not set privileged
+immutable or append flags. The module owner reported those tests passing, and
+the parent reported its subsequent full Rust suite passing 123 tests after the
+correction. This review inspected the final guard code without duplicating that
+full-suite run.
 
 ## Independent validation
 
@@ -87,8 +117,15 @@ transactional preview/event insertion failure, and schema-one migration without
 trusting legacy permission authority. All files, attributes, and mode changes
 in these tests were generated under temporary disposable directories.
 
-Not run here: physical power-loss tests; native Windows DACL, integrity-label,
+The later platform compatibility correction was reviewed statically: macOS uses
+fd-based `fstatx_np`/`FILESEC_ACL` presence inspection and rejects any present
+extended ACL, including an empty ACL with unsupported inheritance flags;
+Windows uses the constrained creation-owner policy above. Module-owner checks
+reported Windows GNU test cross-compilation and macOS arm64/x86_64 harness
+typechecks passing. Those checks do not prove native platform behavior.
+
+Not run in this independent review environment: physical power-loss tests; native Windows DACL, integrity-label,
 read-only, or stream behavior; native macOS ACL behavior; and foreign-owner
-mutation tests requiring privileges. The review does not certify primary
+mutation or immutable/append flag-setting tests requiring privileges. The review does not certify primary
 working-tree use, complete metadata replication, or a security boundary against
 processes with equivalent access to the user's files and private state.

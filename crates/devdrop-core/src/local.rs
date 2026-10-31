@@ -1722,10 +1722,6 @@ fn current_file(dir: &Dir, path: &str) -> Result<Option<(String, AccessMetadata)
         Err(_) => Err(err("Cannot verify target content and permissions.")),
     }
 }
-#[cfg(test)]
-fn current_hash(dir: &Dir, path: &str) -> Result<Option<String>> {
-    Ok(current_file(dir, path)?.map(|(hash, _)| hash))
-}
 fn secret_content(bytes: &[u8]) -> bool {
     let s = String::from_utf8_lossy(bytes);
     s.contains("-----BEGIN ENCRYPTED PRIVATE KEY-----")

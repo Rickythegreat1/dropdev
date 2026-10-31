@@ -18,8 +18,8 @@ confirmation. The intent gate does not prove sandboxed directories.
 
 Full ACL, ownership, xattr, audit-policy and timestamp replication is unsupported.
 Only the constrained [file access policy](file-permissions.md) is accepted.
-Windows requires canonical current-user/SYSTEM/Administrators private DACLs,
-current ownership/group and default-medium integrity; production does not rewrite
+Windows requires canonical user/SYSTEM/Administrators private DACLs,
+matching token creation ownership/primary group and default-medium integrity; production does not rewrite
 a directory's ACL to make it pass. Unix rejects extended ACLs/xattrs and special
 bits. Never silently strip metadata to bypass these refusals.
 
@@ -197,3 +197,17 @@ on every plan, explicit CLI/native acknowledgement and persistent UI guidance.
 That historical byte-only limitation is superseded by metadata-version-one
 permission plans described above. Full metadata replication is still unsupported,
 and primary working trees remain prohibited. Use the newest handoff/CI artifacts.
+
+## Permission platform corrections
+
+The first permission-preservation CI run passed Linux but exposed platform
+assumptions. macOS no-ACL files can make `acl_get_fd_np` return null/ENOENT; the
+new descriptor-bound `fstatx_np`/property query accepts only proven absence and
+still blocks every present ACL or query failure. Windows token creation owner
+can be Administrators on an elevated runner. The policy now requires actual
+owner==supported TokenOwner (user or BUILTIN Administrators only), group==token
+primary group, and the same canonical private DACL. Incoming default-created
+files therefore keep the approved ownership without production chown/token
+changes. User-owned files under an Administrator-default process are refused
+before quarantine. Fixture-only setup sets the supported owner/group on its new
+empty root. No arbitrary foreign ownership or unsupported metadata is waived.
