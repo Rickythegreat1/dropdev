@@ -1597,6 +1597,13 @@ mod tests {
             .is_err());
         let nested_state = Engine::open(&w.source.join("metadata")).unwrap();
         assert!(nested_state.register("bad", &w.source, &w.target).is_err());
+        let credential_root = w.source.parent().unwrap().join(".aws").join("project");
+        fs::create_dir_all(&credential_root).unwrap();
+        assert!(e
+            .register("bad", &credential_root, &w.target)
+            .unwrap_err()
+            .to_string()
+            .contains("Credential directories"));
         for path in [
             "../outside",
             "/absolute",
