@@ -163,3 +163,9 @@
    public filesystem APIs or PR approvals were created. Draft PR/portable bundle
    carry reviewable source and exact verification; release workflows need actual
    OS runs before installer claims.
+
+Delivery update: Git source push succeeded. Draft PR creation was denied by
+automatic approval review for lack of explicit user PR-publication permission;
+no retry or workaround was attempted. CI is enabled on codex branches and calls
+unsigned platform packaging on public-repository pushes without creating a
+release. Exact remote results are recorded with the portable handoff artifact.

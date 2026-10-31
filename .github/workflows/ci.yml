@@ -2,7 +2,7 @@ name: Verify DevDrop
 
 on:
   push:
-    branches: [main]
+    branches: [main, "codex/**"]
   pull_request:
   workflow_dispatch:
 
@@ -64,3 +64,12 @@ jobs:
         with:
           workspaces: apps/desktop/src-tauri -> target
       - run: cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml --locked
+
+  packages:
+    name: Unsigned platform build artifacts
+    if: github.event_name == 'push' && github.event.repository.private == false
+    permissions:
+      contents: read
+    uses: ./.github/workflows/release.yml
+    with:
+      create_draft_release: false

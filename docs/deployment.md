@@ -114,3 +114,19 @@ escalation still failed reading apt configuration and creating
 Linux Tauri compilation/installer output is blocked on an environment with
 those official packages or an authorized privileged package installer. Windows
 and macOS packaging have not been run here.
+
+## Source publication and review
+
+The tested source branch is `codex/local-sync-mvp-20261031` in the public
+`Rickythegreat1/dropdev` repository. Git push succeeded using the existing
+repository access. Creating the draft PR through the GitHub connector was
+**denied by automatic approval review**, which stated that explicit user
+permission is required for that external publication action. The PR was not
+created and the denied operation was not retried through another route.
+The parent must resolve that approval before opening the PR.
+
+CI also runs for the `codex/**` review branches. On public-repository pushes it
+calls the platform packaging workflow with draft-release creation disabled, so
+Windows/macOS/Linux binaries can be verified without publishing or approving a
+release. No paid runner or signing credential is configured. Read the actual
+workflow result before describing any OS artifact as passed.

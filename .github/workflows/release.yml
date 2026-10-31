@@ -1,6 +1,12 @@
 name: Package DevDrop draft
 
 on:
+  workflow_call:
+    inputs:
+      create_draft_release:
+        type: boolean
+        required: false
+        default: false
   workflow_dispatch:
     inputs:
       create_draft_release:
