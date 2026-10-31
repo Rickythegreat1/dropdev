@@ -15,6 +15,12 @@ test("preview needs a separate explicit approval and displays an honest receipt"
     name: "Apply to virtual replica",
   });
   expect((apply as HTMLButtonElement).disabled).toBe(true);
+  expect(
+    screen.getByRole("note", { name: "Beta safety limit" }).textContent,
+  ).toContain("Never register or sync primary working trees");
+  expect(screen.getByRole("checkbox").parentElement?.textContent).toContain(
+    "permissions or executable bits",
+  );
   expect(screen.getByText("src/notes.ts")).toBeTruthy();
   await user.click(screen.getByRole("checkbox"));
   expect((apply as HTMLButtonElement).disabled).toBe(false);

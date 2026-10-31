@@ -51,3 +51,80 @@ test("native recovery activity shows only allowlisted backup metadata and manual
   expect(screen.queryByText("CANARY_DO_NOT_RENDER_RAW_BYTES")).toBeNull();
   expect(screen.queryByText(/virtual folders only/)).toBeNull();
 });
+
+test("native apply sends disposable-copy confirmation only after the explicit beta acknowledgement", async () => {
+  command.mockClear();
+  const state = {
+    pairs: [
+      {
+        id: "pair-beta",
+        name: "Beta copies",
+        source: "/disposable/source",
+        target: "/disposable/target",
+      },
+    ],
+    plans: [],
+    events: [],
+  };
+  const plan = {
+    id: "plan-beta",
+    pair_id: "pair-beta",
+    operations: [
+      {
+        path: "README.md",
+        kind: "copy",
+        side: "target",
+        before: null,
+        after: "a".repeat(64),
+      },
+    ],
+    blockers: [],
+    state: "planned",
+  };
+  command.mockImplementation(async (request) => {
+    if (request.action === "preview") return plan;
+    if (request.action === "apply")
+      return {
+        plan_id: plan.id,
+        state: "verified",
+        changed: ["README.md"],
+        message: "Disposable copy updated.",
+      };
+    return state;
+  });
+  render(<App />);
+  const user = userEvent.setup();
+  await screen.findByRole("heading", { name: "Beta copies" });
+  for (const route of ["Add project", "Activity & recovery", "Overview"]) {
+    await user.click(screen.getByRole("button", { name: route }));
+    expect(
+      screen.getByRole("note", { name: "Beta safety limit" }).textContent,
+    ).toContain("file permissions and executable bits are not preserved");
+  }
+  await user.click(
+    screen.getByRole("button", { name: "Scan & preview changes" }),
+  );
+  const apply = await screen.findByRole("button", {
+    name: "Apply approved plan",
+  });
+  expect((apply as HTMLButtonElement).disabled).toBe(true);
+  await user.click(apply);
+  expect(
+    command.mock.calls.some(([request]) => request.action === "apply"),
+  ).toBe(false);
+  const acknowledgement = screen.getByRole("checkbox");
+  expect(acknowledgement.parentElement?.textContent).toContain(
+    "disposable copies, never primary working trees",
+  );
+  expect(acknowledgement.parentElement?.textContent).toContain(
+    "do not preserve file permissions or executable bits",
+  );
+  await user.click(acknowledgement);
+  await user.click(apply);
+  expect(command).toHaveBeenCalledWith({
+    action: "apply",
+    plan_id: "plan-beta",
+    approval: "plan-beta",
+    disposable_copies: true,
+  });
+});

@@ -171,10 +171,17 @@ export function App() {
             Refresh evidence
           </button>
         </header>
+        <div className="betaBanner" role="note" aria-label="Beta safety limit">
+          <strong>Experimental beta — disposable project copies only.</strong>{" "}
+          Never register or sync primary working trees. Replacement and rollback
+          copy content only; file permissions and executable bits are not
+          preserved.
+        </div>
         {!native && (
           <div className="demoBanner">
             <strong>Try the workflow.</strong> This browser demo updates virtual
-            folders only. Install the desktop app to sync local files.{" "}
+            folders only. Desktop beta setup is for disposable project copies
+            only.{" "}
             <a
               href="https://github.com/Rickythegreat1/dropdev#readme"
               target="_blank"
@@ -344,7 +351,8 @@ export function App() {
                   </label>
                   <p className="muted">
                     Folders must exist, be separate and contain no symlink
-                    roots. Use a disposable pair for your first run.
+                    roots. Both folders must be disposable project copies, never
+                    primary working trees.
                   </p>
                   <button className="primary" disabled={busy}>
                     Register folder pair
@@ -493,7 +501,10 @@ export function App() {
                         disabled={!readyToApply || busy}
                         onChange={(e) => setApproval(e.target.checked)}
                       />
-                      I reviewed all paths in <code>{preview.id}</code>
+                      I reviewed all paths in <code>{preview.id}</code> and
+                      confirm these are disposable copies, never primary working
+                      trees. I understand beta replacement and rollback do not
+                      preserve file permissions or executable bits.
                     </label>
                     <button
                       className="primary"
@@ -504,6 +515,7 @@ export function App() {
                             action: "apply",
                             plan_id: preview.id,
                             approval: preview.id,
+                            disposable_copies: approval,
                           });
                           setReceipt(r);
                           setApproval(false);

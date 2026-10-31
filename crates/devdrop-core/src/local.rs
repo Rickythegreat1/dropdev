@@ -13,6 +13,12 @@ use std::{
     time::Duration,
 };
 
+/// This release copies bytes; it cannot promise permission/ACL restoration.
+pub const BETA_WARNING: &str = "DevDrop beta: use disposable project copies only. Do not use primary working trees. Replacement and rollback do not preserve file permissions or executable bits.";
+fn beta_warning() -> String {
+    BETA_WARNING.to_owned()
+}
+
 type Snapshot = BTreeMap<String, String>;
 type Result<T> = std::result::Result<T, LocalError>;
 
@@ -65,6 +71,8 @@ pub struct Operation {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Plan {
+    #[serde(default = "beta_warning")]
+    pub beta_warning: String,
     pub id: String,
     pub pair_id: String,
     pub operations: Vec<Operation>,
@@ -412,6 +420,7 @@ impl Engine {
             )[..32]
         );
         let plan = Plan {
+            beta_warning: beta_warning(),
             id,
             pair_id: p.id.clone(),
             operations,
@@ -422,8 +431,11 @@ impl Engine {
             base_revision,
             reverses,
         };
-        self.save_plan(&plan)?;
-        self.event("preview", &p.id, &plan.id, json!({"plan":plan}))?;
+        self.transaction(|| {
+            self.save_plan(&plan)?;
+            self.event("preview", &p.id, &plan.id, json!({"plan":plan}))?;
+            Ok(())
+        })?;
         Ok(plan)
     }
     /// Explicit resolution stores and retains both versions in CAS before any write.
@@ -494,7 +506,20 @@ impl Engine {
             current.blockers,
         )
     }
-    pub fn apply(&self, id: &str, approval: &str) -> Result<Receipt> {
+    /// Apply is restricted to callers explicitly confirming disposable copies.
+    /// This is an intent acknowledgement, not proof that a root is a sandbox.
+    pub fn apply(&self, id: &str, approval: &str, disposable_copies: bool) -> Result<Receipt> {
+        if !disposable_copies {
+            if let Ok(plan) = self.plan(id) {
+                self.event(
+                    "refused",
+                    &plan.pair_id,
+                    id,
+                    json!({"reason":"disposable_copy_acknowledgement_required"}),
+                )?;
+            }
+            return Err(err(BETA_WARNING));
+        }
         self.apply_inner(id, approval, None)
     }
     fn apply_inner(
@@ -548,7 +573,7 @@ impl Engine {
                 "Git worktree changed; create a new preview after preserving local work.",
             ));
         }
-        self.event("approved", &p.id, id, json!({"approved_plan_id":id}))?;
+        self.event("approved", &p.id, id, json!({"approved_plan_id":id,"disposable_copies_acknowledged":true,"beta_warning":BETA_WARNING}))?;
         plan.state = "applying".into();
         self.save_plan(&plan)?;
         self.event(
@@ -1306,7 +1331,11 @@ pub fn dispatch(state_dir: &Path, request: Value) -> Result<Value> {
             text(&request, "choice")?
         )?),
         "apply" | "rollback" => {
-            json!(engine.apply(text(&request, "plan_id")?, text(&request, "approval")?)?)
+            json!(engine.apply(
+                text(&request, "plan_id")?,
+                text(&request, "approval")?,
+                request.get("disposable_copies").and_then(Value::as_bool) == Some(true)
+            )?)
         }
         "rollback_preview" => json!(engine.rollback_preview(text(&request, "plan_id")?)?),
         "events" => engine.events()?,
@@ -1374,14 +1403,18 @@ mod tests {
         assert_eq!(plan.operations.len(), 1);
         assert_eq!(plan.operations[0].kind, "copy");
         assert!(!w.target.join("src/main.rs").exists());
-        assert!(e.apply(&plan.id, "yes").is_err());
+        assert!(e.apply(&plan.id, "yes", true).is_err());
         drop(e);
         let e = w.engine();
         assert_eq!(e.pairs().unwrap()[0].id, p.id);
-        let receipt = e.apply(&plan.id, &plan.id).unwrap();
+        let receipt = e.apply(&plan.id, &plan.id, true).unwrap();
         assert_eq!(receipt.state, "verified");
         assert_eq!(fs::read(w.target.join("src/main.rs")).unwrap(), b"first");
-        assert!(e.apply(&plan.id, &plan.id).unwrap().changed.is_empty());
+        assert!(e
+            .apply(&plan.id, &plan.id, true)
+            .unwrap()
+            .changed
+            .is_empty());
         assert!(e.preview(&p.id).unwrap().operations.is_empty());
     }
     #[test]
@@ -1393,19 +1426,19 @@ mod tests {
         let first = e.preview(&p.id).unwrap();
         w.source("a", b"new source");
         assert!(e
-            .apply(&first.id, &first.id)
+            .apply(&first.id, &first.id, true)
             .unwrap_err()
             .to_string()
             .contains("stale"));
         let second = e.preview(&p.id).unwrap();
         w.target("b", b"independent edit");
-        assert!(e.apply(&second.id, &second.id).is_err());
+        assert!(e.apply(&second.id, &second.id, true).is_err());
         assert!(!w.target.join("a").exists());
         fs::remove_file(w.target.join("b")).unwrap();
         let a = e.preview(&p.id).unwrap();
         let b = e.preview(&p.id).unwrap();
-        e.apply(&a.id, &a.id).unwrap();
-        assert!(e.apply(&b.id, &b.id).is_err());
+        e.apply(&a.id, &a.id, true).unwrap();
+        assert!(e.apply(&b.id, &b.id, true).is_err());
     }
     #[test]
     fn conflict_preserves_both_and_resolution_is_separately_approved() {
@@ -1416,15 +1449,15 @@ mod tests {
         let p = w.register(&e);
         let plan = e.preview(&p.id).unwrap();
         assert_eq!(plan.operations[0].kind, "conflict");
-        assert!(e.apply(&plan.id, &plan.id).is_err());
+        assert!(e.apply(&plan.id, &plan.id, true).is_err());
         assert_eq!(fs::read(w.target.join("a")).unwrap(), b"target");
         for bytes in [b"source".as_slice(), b"target".as_slice()] {
             assert_eq!(e.object(&hash(bytes)).unwrap(), bytes);
         }
         let resolution = e.resolve_preview(&p.id, "a", "both").unwrap();
         assert_eq!(resolution.operations.len(), 3);
-        assert!(e.apply(&resolution.id, &plan.id).is_err());
-        e.apply(&resolution.id, &resolution.id).unwrap();
+        assert!(e.apply(&resolution.id, &plan.id, true).is_err());
+        e.apply(&resolution.id, &resolution.id, true).unwrap();
         let sibling = format!("a.devdrop-conflict-{}", &hash(b"target")[..12]);
         assert_eq!(fs::read(w.target.join(&sibling)).unwrap(), b"target");
         assert_eq!(fs::read(w.source.join(&sibling)).unwrap(), b"target");
@@ -1440,12 +1473,12 @@ mod tests {
         let p = w.register(&e);
         let resolve = e.resolve_preview(&p.id, "a", "target").unwrap();
         assert_eq!(resolve.operations[0].side, "source");
-        e.apply(&resolve.id, &resolve.id).unwrap();
+        e.apply(&resolve.id, &resolve.id, true).unwrap();
         assert_eq!(fs::read(w.source.join("a")).unwrap(), b"target");
         fs::remove_file(w.target.join("a")).unwrap();
         let conflict = e.preview(&p.id).unwrap();
         assert_eq!(conflict.operations[0].kind, "conflict");
-        assert!(e.apply(&conflict.id, &conflict.id).is_err());
+        assert!(e.apply(&conflict.id, &conflict.id, true).is_err());
     }
     #[test]
     fn approved_replace_delete_tombstone_restore_and_dirty_guard() {
@@ -1454,27 +1487,27 @@ mod tests {
         let e = w.engine();
         let p = w.register(&e);
         let initial = e.preview(&p.id).unwrap();
-        e.apply(&initial.id, &initial.id).unwrap();
+        e.apply(&initial.id, &initial.id, true).unwrap();
         w.source("a", b"updated");
         let update = e.preview(&p.id).unwrap();
         assert_eq!(update.operations[0].kind, "replace");
-        e.apply(&update.id, &update.id).unwrap();
+        e.apply(&update.id, &update.id, true).unwrap();
         let undo = e.rollback_preview(&update.id).unwrap();
         w.target("a", b"new local work");
-        assert!(e.apply(&undo.id, &undo.id).is_err());
+        assert!(e.apply(&undo.id, &undo.id, true).is_err());
         assert!(e.rollback_preview(&update.id).is_err());
         w.target("a", b"updated");
         let undo = e.rollback_preview(&update.id).unwrap();
-        e.apply(&undo.id, &undo.id).unwrap();
+        e.apply(&undo.id, &undo.id, true).unwrap();
         assert_eq!(fs::read(w.target.join("a")).unwrap(), b"original");
         // Source differs again after rollback; resolve intentionally, then delete from the shared baseline.
         let resolution = e.resolve_preview(&p.id, "a", "source").unwrap();
-        e.apply(&resolution.id, &resolution.id).unwrap();
+        e.apply(&resolution.id, &resolution.id, true).unwrap();
         fs::remove_file(w.source.join("a")).unwrap();
         let deletion = e.preview(&p.id).unwrap();
         assert_eq!(deletion.operations[0].kind, "delete");
         assert!(w.target.join("a").exists());
-        e.apply(&deletion.id, &deletion.id).unwrap();
+        e.apply(&deletion.id, &deletion.id, true).unwrap();
         assert!(!w.target.join("a").exists());
         assert!(e
             .events()
@@ -1484,7 +1517,7 @@ mod tests {
             .iter()
             .any(|v| v["kind"] == "tombstone"));
         let restore = e.rollback_preview(&deletion.id).unwrap();
-        e.apply(&restore.id, &restore.id).unwrap();
+        e.apply(&restore.id, &restore.id, true).unwrap();
         assert_eq!(fs::read(w.target.join("a")).unwrap(), b"updated");
     }
     #[test]
@@ -1502,10 +1535,10 @@ mod tests {
         let e = w.engine();
         assert_eq!(e.plan(&plan.id).unwrap().state, "recovery_required");
         assert!(e.preview(&p.id).is_err());
-        assert!(e.apply(&plan.id, &plan.id).is_err());
+        assert!(e.apply(&plan.id, &plan.id, true).is_err());
         let rollback = e.rollback_preview(&plan.id).unwrap();
         assert_eq!(rollback.operations.len(), 1);
-        e.apply(&rollback.id, &rollback.id).unwrap();
+        e.apply(&rollback.id, &rollback.id, true).unwrap();
         assert!(!w.target.join("a").exists());
         assert_eq!(fs::read(w.source.join("a")).unwrap(), b"alpha");
         assert_eq!(e.plan(&plan.id).unwrap().state, "rolled_back");
@@ -1526,7 +1559,7 @@ mod tests {
         let e = w.engine();
         let rollback = e.rollback_preview(&plan.id).unwrap();
         assert_eq!(rollback.operations.len(), 1);
-        e.apply(&rollback.id, &rollback.id).unwrap();
+        e.apply(&rollback.id, &rollback.id, true).unwrap();
         assert!(!w.target.join("a").exists());
     }
     #[test]
@@ -1538,7 +1571,7 @@ mod tests {
         let p = w.register(&e);
         let plan = e.preview(&p.id).unwrap();
         fs::write(w.state.join("objects").join(hash(b"alpha")), b"corrupt").unwrap();
-        assert!(e.apply(&plan.id, &plan.id).is_err());
+        assert!(e.apply(&plan.id, &plan.id, true).is_err());
         assert!(!w.target.join("a").exists());
     }
     #[test]
@@ -1565,7 +1598,7 @@ mod tests {
             .join(hash(canary.as_bytes()))
             .exists());
         assert_eq!(plan.operations.len(), 2);
-        e.apply(&plan.id, &plan.id).unwrap();
+        e.apply(&plan.id, &plan.id, true).unwrap();
         assert!(!w.target.join(".env").exists());
         assert!(!w.target.join("ignored.txt").exists());
     }
@@ -1633,7 +1666,7 @@ mod tests {
         let p = w.register(&e);
         let plan = e.preview(&p.id).unwrap();
         symlink(&outside, w.target.join("nested")).unwrap();
-        assert!(e.apply(&plan.id, &plan.id).is_err());
+        assert!(e.apply(&plan.id, &plan.id, true).is_err());
         assert_eq!(fs::read(outside.join("a")).unwrap(), b"outside");
         fs::remove_file(w.target.join("nested")).unwrap();
         symlink(outside.join("a"), w.source.join("link")).unwrap();
@@ -1646,8 +1679,8 @@ mod tests {
         let p = w.register(&e);
         let plan = e.preview(&p.id).unwrap();
         assert!(plan.operations.is_empty());
-        assert!(e.apply(&plan.id, "").is_err());
-        assert_eq!(e.apply(&plan.id, &plan.id).unwrap().state, "verified");
+        assert!(e.apply(&plan.id, "", true).is_err());
+        assert_eq!(e.apply(&plan.id, &plan.id, true).unwrap().state, "verified");
         assert!(e
             .events()
             .unwrap()
@@ -1663,7 +1696,7 @@ mod tests {
         let e = w.engine();
         let p = w.register(&e);
         let initial = e.preview(&p.id).unwrap();
-        e.apply(&initial.id, &initial.id).unwrap();
+        e.apply(&initial.id, &initial.id, true).unwrap();
         w.source("a", b"incoming");
         let mut plan = e.preview(&p.id).unwrap();
         plan.state = "applying".into();
@@ -1688,7 +1721,7 @@ mod tests {
         let e = w.engine();
         let p = w.register(&e);
         let initial = e.preview(&p.id).unwrap();
-        e.apply(&initial.id, &initial.id).unwrap();
+        e.apply(&initial.id, &initial.id, true).unwrap();
         w.source("a", b"incoming");
         let plan = e.preview(&p.id).unwrap();
         let result = e.write_operation_with_hook(&p, &plan.operations[0], &plan.id, 0, |stage| {
@@ -1717,7 +1750,7 @@ mod tests {
         let e = w.engine();
         let p = w.register(&e);
         let initial = e.preview(&p.id).unwrap();
-        e.apply(&initial.id, &initial.id).unwrap();
+        e.apply(&initial.id, &initial.id, true).unwrap();
         w.source("a", b"new");
         let mut plan = e.preview(&p.id).unwrap();
         plan.state = "applying".into();
@@ -1729,7 +1762,103 @@ mod tests {
         let e = w.engine();
         let rollback = e.rollback_preview(&plan.id).unwrap();
         assert_eq!(rollback.operations[0].kind, "copy");
-        e.apply(&rollback.id, &rollback.id).unwrap();
+        e.apply(&rollback.id, &rollback.id, true).unwrap();
         assert_eq!(fs::read(w.target.join("a")).unwrap(), b"old");
+    }
+    #[test]
+    fn preview_and_event_commit_atomically_when_event_insert_fails() {
+        let w = Workspace::new();
+        w.source("src/main.rs", b"generated journal proof");
+        let e = w.engine();
+        let p = w.register(&e);
+        let before = e.events().unwrap();
+        e.db.execute_batch("CREATE TRIGGER reject_preview_event BEFORE INSERT ON events WHEN NEW.kind='preview' BEGIN SELECT RAISE(ABORT, 'generated preview event rejection'); END;").unwrap();
+        assert!(e.preview(&p.id).is_err());
+        assert!(
+            e.plans().unwrap().is_empty(),
+            "failed event insertion must not leave an orphan plan"
+        );
+        assert_eq!(e.events().unwrap(), before);
+        assert!(e.db.is_autocommit());
+        assert!(!w.target.join("src/main.rs").exists());
+        drop(e);
+        let e = w.engine();
+        assert!(e.plans().unwrap().is_empty());
+        assert_eq!(e.events().unwrap(), before);
+        e.db.execute_batch("DROP TRIGGER reject_preview_event")
+            .unwrap();
+        let plan = e.preview(&p.id).unwrap();
+        assert_eq!(e.plans().unwrap().len(), 1);
+        let events = e.events().unwrap();
+        let previews: Vec<_> = events
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|event| event["kind"] == "preview")
+            .collect();
+        assert_eq!(previews.len(), 1);
+        assert_eq!(previews[0]["evidence"]["plan"]["id"], plan.id);
+    }
+    #[test]
+    fn all_apply_entrypoints_require_explicit_disposable_copy_acknowledgement() {
+        let w = Workspace::new();
+        w.source("src/main.rs", b"generated beta gate proof");
+        let e = w.engine();
+        let p = w.register(&e);
+        let plan = e.preview(&p.id).unwrap();
+        assert_eq!(plan.beta_warning, BETA_WARNING);
+        assert_eq!(
+            e.apply(&plan.id, &plan.id, false).unwrap_err().to_string(),
+            BETA_WARNING
+        );
+        assert!(!w.target.join("src/main.rs").exists());
+        drop(e);
+        for action in ["apply", "rollback"] {
+            for flag in [
+                None,
+                Some(json!(false)),
+                Some(json!("true")),
+                Some(json!(1)),
+            ] {
+                let mut request = json!({"action":action,"plan_id":plan.id,"approval":plan.id});
+                if let Some(flag) = flag {
+                    request["disposable_copies"] = flag;
+                }
+                assert_eq!(
+                    dispatch(&w.state, request).unwrap_err().to_string(),
+                    BETA_WARNING
+                );
+                assert!(!w.target.join("src/main.rs").exists());
+            }
+        }
+        let result = dispatch(
+            &w.state,
+            json!({"action":"apply","plan_id":plan.id,"approval":plan.id,"disposable_copies":true}),
+        )
+        .unwrap();
+        assert_eq!(result["state"], "verified");
+        let e = w.engine();
+        let approved = e.events().unwrap();
+        assert!(approved
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["kind"] == "approved"
+                && event["evidence"]["disposable_copies_acknowledged"] == true));
+        let rollback = e.rollback_preview(&plan.id).unwrap();
+        drop(e);
+        assert_eq!(
+            dispatch(
+                &w.state,
+                json!({"action":"rollback","plan_id":rollback.id,"approval":rollback.id})
+            )
+            .unwrap_err()
+            .to_string(),
+            BETA_WARNING
+        );
+        assert!(w.target.join("src/main.rs").exists());
+        let result=dispatch(&w.state,json!({"action":"rollback","plan_id":rollback.id,"approval":rollback.id,"disposable_copies":true})).unwrap();
+        assert_eq!(result["state"], "rolled_back");
+        assert!(!w.target.join("src/main.rs").exists());
     }
 }

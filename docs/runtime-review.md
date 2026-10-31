@@ -17,16 +17,24 @@ under `/tmp` and `tempfile`; no real user project or credential file was used.
 | Registered subdirectories bypassed Git dirty-state checks. | A generated committed repository with a modified tracked file below the registered subdirectory produced no blocker. | Ancestor worktree detection now protects nested roots. Independent regression passes. |
 | Read-only Git status could execute repository-configured filters. | A generated clean filter wrote an execution marker during `git -c core.fsmonitor=false status`. | Configured external clean/process filters are refused before status, fsmonitor is disabled, and inherited Git selectors are removed. Independent regression verifies the filter does not run. |
 | Restore-object entries were not directory-synced. | CAS file sync alone did not persist its new directory entry before destructive operations. | Object and state directory synchronization was added on Unix. Windows power-loss behavior has not been verified. |
-| Materialized registry/plan records and their replay events used separate autocommits. | A process crash between the two writes could leave state without its corresponding event. | Registration and preview creation now couple state/event writes in SQLite transactions. |
+| Materialized registry/plan records and their replay events used separate autocommits. | A process crash between the two writes could leave state without its corresponding event. | An audit at `4852013` corrected the earlier review claim: preview creation still used separate writes. `new_plan` now wraps plan persistence and its preview event in one transaction. A SQLite trigger that aborts event insertion proves the orphan plan is rolled back, including across reopen; the regression failed before the fix and passes after it. |
 | Ignore-policy reading needed its own preflight and size budget. | A generated `.gitignore` larger than 1 MiB was accepted and cached by the original scanner. Automatic walker policy parsing could precede symlink checks. | Automatic walker policy loading is now disabled; bounded explicit parsing rejects symlinks, special files, invalid UTF-8, and policies larger than 1 MiB. Both independent regressions pass. |
 | Nested anchored ignore patterns were scoped to the root instead of their containing directory. | A generated `nested/.gitignore` containing `/private.txt` did not exclude `nested/private.txt`. | Each ignore matcher is now rooted at its own containing directory, with nested precedence and ignored-parent pruning. Independent anchored-rule and nested-whitelist regressions pass. |
+| Replacement and rollback preserve bytes but do not preserve file metadata. | Incoming content is materialized as a new regular file; mode, executable bits, ownership, timestamps, ACLs, and extended attributes are not restored from CAS. | This remains an explicit beta limitation. Core apply and rollback entrypoints require a disposable-copy acknowledgement in addition to exact-plan approval. CLI and desktop show the restriction. The acknowledgement declares caller intent; it does not prove or technically sandbox the selected directories. |
 
 ## Verified boundaries
 
 - The desktop uses native Tauri IPC. The hosted browser build has no
   filesystem-mutating localhost or public API.
 - Applying a plan requires its exact ID, fresh source/target scans, and the
-  baseline revision used by its preview. Repeated verified requests are inert.
+  baseline revision used by its preview. Both apply and rollback also require
+  the explicit disposable-copy acknowledgement. Missing, false, string, or
+  numeric acknowledgements are refused; only JSON boolean `true` passes the
+  native dispatcher. Approved events record that acknowledgement. Repeated
+  verified requests are inert.
+- This is a byte-only beta for disposable copies. Primary working trees are
+  outside its permitted use. The application cannot verify that a caller
+  supplied a disposable copy; the acknowledgement is not a filesystem sandbox.
 - Conflicts retain both hashes/objects and require a separate resolution
   preview and approval.
 - Deletion records a tombstone with restore evidence before mutation.
@@ -41,8 +49,13 @@ under `/tmp` and `tempfile`; no real user project or credential file was used.
 
 `cargo test -p devdrop-core --test security_regressions`: **9 passed, 0 failed**
 after the reviewed corrections. Both `cargo test -p devdrop-core editor_race`
-cases passed with the quarantine design. No identified regression remains open
-in this reviewed local-sync slice.
+cases passed with the quarantine design. The subsequent
+`preview_and_event_commit_atomically_when_event_insert_fails` and
+`all_apply_entrypoints_require_explicit_disposable_copy_acknowledgement`
+regressions were independently rerun and passed. A full core run before the
+last acknowledgement regression passed 46 unit tests and these 9 integration
+tests. The preview atomicity finding is closed; file-metadata preservation
+remains outside the disposable-copy beta scope.
 Final aggregate tests, native packaging, and hosted deployment verification are
 owned by the parent implementation task and are not certified by this review.
 

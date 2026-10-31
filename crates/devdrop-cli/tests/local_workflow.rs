@@ -49,17 +49,48 @@ fn separate_process_registration_preview_approval_and_restore() {
     let plan_id = preview["id"].as_str().expect("plan id");
     assert!(!target.join("hello.txt").exists());
     assert!(!preview.to_string().contains("DO_NOT_LEAK"));
-    let refused = run(&state, &["apply", plan_id, "--approve", "wrong-plan"]);
+    let refused = run(
+        &state,
+        &[
+            "apply",
+            plan_id,
+            "--approve",
+            "wrong-plan",
+            "--disposable-copies",
+        ],
+    );
     assert!(!refused.status.success());
     assert!(!target.join("hello.txt").exists());
-    successful(&state, &["apply", plan_id, "--approve", plan_id]);
+    // Approval alone cannot enable beta byte-only writes to an unacknowledged tree.
+    let missing_acknowledgement = run(&state, &["apply", plan_id, "--approve", plan_id]);
+    assert!(!missing_acknowledgement.status.success());
+    assert!(!target.join("hello.txt").exists());
+    successful(
+        &state,
+        &[
+            "apply",
+            plan_id,
+            "--approve",
+            plan_id,
+            "--disposable-copies",
+        ],
+    );
     assert_eq!(
         fs::read(target.join("hello.txt")).unwrap(),
         b"hello fixture"
     );
     assert!(!target.join(".env").exists());
     // Repeated approval must never duplicate a mutation or lose the receipt.
-    let _ = run(&state, &["apply", plan_id, "--approve", plan_id]);
+    let _ = run(
+        &state,
+        &[
+            "apply",
+            plan_id,
+            "--approve",
+            plan_id,
+            "--disposable-copies",
+        ],
+    );
     assert_eq!(
         fs::read(target.join("hello.txt")).unwrap(),
         b"hello fixture"
@@ -67,7 +98,19 @@ fn separate_process_registration_preview_approval_and_restore() {
     let undo = successful(&state, &["rollback-preview", plan_id]);
     let undo_id = undo["id"].as_str().expect("undo plan id");
     assert!(target.join("hello.txt").exists());
-    successful(&state, &["apply", undo_id, "--approve", undo_id]);
+    let missing_rollback_acknowledgement = run(&state, &["apply", undo_id, "--approve", undo_id]);
+    assert!(!missing_rollback_acknowledgement.status.success());
+    assert!(target.join("hello.txt").exists());
+    successful(
+        &state,
+        &[
+            "apply",
+            undo_id,
+            "--approve",
+            undo_id,
+            "--disposable-copies",
+        ],
+    );
     assert!(!target.join("hello.txt").exists());
     assert!(!successful(&state, &["events"])
         .to_string()
@@ -95,8 +138,22 @@ fn stale_preview_cannot_overwrite_a_new_target_edit() {
     let plan = successful(&state, &["preview", pair["id"].as_str().unwrap()]);
     fs::write(target.join("code.txt"), b"local edit").unwrap();
     let id = plan["id"].as_str().unwrap();
-    assert!(!run(&state, &["apply", id, "--approve", id])
-        .status
-        .success());
+    assert!(!run(
+        &state,
+        &["apply", id, "--approve", id, "--disposable-copies"]
+    )
+    .status
+    .success());
     assert_eq!(fs::read(target.join("code.txt")).unwrap(), b"local edit");
+}
+
+#[test]
+fn beta_apply_help_explains_disposable_copy_and_mode_limit() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = run(temp.path(), &["apply", "--help"]);
+    assert!(output.status.success());
+    let help = String::from_utf8(output.stdout).unwrap();
+    assert!(help.contains("--disposable-copies"));
+    assert!(help.contains("never primary working trees"));
+    assert!(help.contains("do not preserve permissions or executable bits"));
 }

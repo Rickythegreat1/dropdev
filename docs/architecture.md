@@ -28,6 +28,13 @@ verification; recovery refuses to overwrite newer work. A writer lock serializes
 CLI/native/MCP access and SQLite FULL/WAL records transitions. Unix fsyncs object,
 state and changed directories. Retained backup directories are excluded from sync.
 
+Preview plan rows and their event now commit in the same SQLite transaction;
+fault-injected event failure rolls the plan back as well. Every apply/rollback
+also requires explicit caller confirmation that the roots are disposable copies.
+This gate declares intent and does not establish a sandbox. The byte-only object
+store/restore path does not preserve permissions, executable bits or ACLs; the
+native UI, CLI and plan metadata forbid primary working trees in this beta.
+
 The following foundation sections retain historical contracts for the observer
 daemon, legacy fixture commands and hydration simulation. Statements that apply
 is unavailable refer to those original surfaces, not the new `local` runtime.

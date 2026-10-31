@@ -102,12 +102,16 @@ enum LocalCommand {
     },
     /// Reconcile both roots and persist an exact dry-run plan.
     Preview { pair_id: String },
-    /// Apply one recorded plan after separate review and explicit approval.
+    /// Beta: apply a reviewed plan only to disposable copies, never primary working trees.
+    /// Replace and rollback preserve bytes but do not preserve permissions or executable bits.
     Apply {
         plan_id: String,
         /// Must exactly match the reviewed plan ID.
         #[arg(long)]
         approve: String,
+        /// Acknowledge disposable copies only; replace/rollback do not preserve mode bits.
+        #[arg(long)]
+        disposable_copies: bool,
     },
     /// Prepare an undo plan. Review it, then apply its new plan ID.
     RollbackPreview { plan_id: String },
@@ -134,8 +138,12 @@ fn local_request(command: &LocalCommand) -> serde_json::Value {
             target,
         } => json!({"action":"register", "name":name, "source":source, "target":target}),
         LocalCommand::Preview { pair_id } => json!({"action":"preview", "pair_id":pair_id}),
-        LocalCommand::Apply { plan_id, approve } => {
-            json!({"action":"apply", "plan_id":plan_id, "approval":approve})
+        LocalCommand::Apply {
+            plan_id,
+            approve,
+            disposable_copies,
+        } => {
+            json!({"action":"apply", "plan_id":plan_id, "approval":approve,"disposable_copies":disposable_copies})
         }
         LocalCommand::RollbackPreview { plan_id } => {
             json!({"action":"rollback_preview", "plan_id":plan_id})

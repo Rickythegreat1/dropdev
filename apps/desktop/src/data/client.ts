@@ -108,6 +108,14 @@ function event(state: Demo, kind: string, plan_id?: string) {
   state.events.push({ id: state.events.length + 1, kind, plan_id });
 }
 export async function command<T>(request: Request): Promise<T> {
+  if (
+    (request.action === "apply" || request.action === "rollback") &&
+    request.disposable_copies !== true
+  ) {
+    throw new Error(
+      "Beta apply requires confirmation of disposable project copies only. Primary working trees are forbidden; permissions and executable bits are not preserved.",
+    );
+  }
   if (native) return invoke<T>("local_command", { request });
   const d = session;
   let result: unknown;

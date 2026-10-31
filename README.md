@@ -5,7 +5,18 @@ approval-gated workflow. Rust owns filesystem access; SQLite WAL records project
 pairs, previews, approvals, tombstones and receipts. React/Tauri provides the
 native control surface. No Docker is required.
 
-## Working local MVP
+## Disposable-copy beta only
+
+Do not register or sync primary working trees. Use disposable project copies
+only. Replacement and rollback restore file bytes, but do not preserve file
+permissions, executable bits, ownership, ACLs, or other file metadata.
+
+Every apply and rollback requires both the exact plan approval and an explicit
+disposable-copy acknowledgement: the native approval checkbox or the CLI
+`--disposable-copies` flag. Plans also carry this beta warning. This confirms
+caller intent; it does not prove the directories are copies or sandbox them.
+
+## Implemented local workflow
 
 - Register separate source and replica directories. Registration does not copy files.
 - Scan eligible content into a verified BLAKE3 object cache and persist an exact preview.
@@ -23,7 +34,7 @@ loopback-only and separate from the durable native sync workflow.
 
 ## Try the local workflow
 
-Use two disposable directories first. Install Rust and Git, then build:
+Use two disposable project-copy directories only. Install Rust and Git, then build:
 
 ```sh
 cargo build --workspace --locked
@@ -31,9 +42,9 @@ cargo build --workspace --locked
   "Disposable workspace" /tmp/devdrop-source /tmp/devdrop-replica
 ./target/debug/devdrop local --state-dir /tmp/devdrop-state list
 ./target/debug/devdrop local --state-dir /tmp/devdrop-state preview PAIR_ID
-./target/debug/devdrop local --state-dir /tmp/devdrop-state apply PLAN_ID --approve PLAN_ID
+./target/debug/devdrop local --state-dir /tmp/devdrop-state apply PLAN_ID --approve PLAN_ID --disposable-copies
 ./target/debug/devdrop local --state-dir /tmp/devdrop-state rollback-preview PLAN_ID
-# Review the returned rollback plan, then apply its own ID with --approve.
+# Review the rollback plan, then apply its ID with --approve and --disposable-copies.
 ```
 
 Create both project directories before registration and keep the state directory
@@ -97,7 +108,7 @@ setup responsibilities. Hydration remains the existing bounded sandbox simulatio
 External Git clean/process filters block sync observation rather than executing
 repository-configured code. Git state itself is never mutated. On Windows,
 SQLite uses FULL durability and file flushes; Unix additionally fsyncs directories.
-This is a reviewed beta, not an independently certified backup system.
+This release remains a content-only beta for disposable project copies.
 
 ## Verification and delivery
 

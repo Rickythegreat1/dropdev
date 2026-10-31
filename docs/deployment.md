@@ -6,6 +6,16 @@ and operating guide. Hosting the browser app does not host or connect the local
 filesystem engine. The observer daemon must remain on loopback; do not expose it
 through a public reverse proxy or add unauthenticated write endpoints.
 
+## Beta release boundary
+
+The native app and CLI are for disposable project copies only. Never register or
+sync primary working trees. Replacement and rollback do not preserve permissions,
+executable bits or other file metadata. Apply and rollback require exact-plan
+approval plus `--disposable-copies` in the CLI or the explicit native checkbox;
+the Rust runtime rejects missing, false and non-boolean confirmations.
+Acknowledgement is an intent gate, not sandbox proof. Installer compilation does
+not validate primary-worktree use or restore permissions.
+
 ## Build and verification
 
 ```sh
@@ -161,3 +171,17 @@ The walker now normalizes its internally generated relative paths; user-supplied
 backslashes remain rejected. `.gitattributes` pins text to LF and marks native
 icons binary, keeping fixture hashes stable. CI concurrency is per commit so
 already-running Unix packaging can finish while the Windows fixes are verified.
+
+## Follow-up audit correction
+
+Independent review of source `4852013` found that preview plan persistence and
+its event insertion still used separate autocommits despite the earlier review
+claim. `new_plan` now wraps both writes in one SQLite transaction. A trigger that
+rejects preview-event insertion reproduces the old orphan-plan defect and now
+proves both rows roll back, including after reopening state.
+
+The same correction adds a runtime disposable-copy confirmation gate, a warning
+on every plan, explicit CLI/native acknowledgement and persistent UI guidance.
+File-mode/permission preservation remains unimplemented; this release is not for
+primary working trees. Use the newest handoff/CI artifact, not the prior
+ungated `4852013` build.

@@ -1040,3 +1040,24 @@ td {
     grid-template-columns: minmax(0, 1fr);
   }
 }
+
+.betaBanner {
+  padding: 14px 40px;
+  background: #f3e5cf;
+  border-bottom: 1px solid #c7a772;
+  color: #6b4727;
+  font-size: 0.8rem;
+  line-height: 1.65;
+}
+@media (max-width: 1080px) {
+  .betaBanner {
+    padding-left: 28px;
+    padding-right: 28px;
+  }
+}
+@media (max-width: 720px) {
+  .betaBanner {
+    padding-left: 20px;
+    padding-right: 20px;
+  }
+}

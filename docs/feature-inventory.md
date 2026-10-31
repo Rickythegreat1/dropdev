@@ -129,6 +129,11 @@ MCP stdio now implements initialization/discovery/calls with redacted previews.
 The browser app runs a clearly labelled virtual-data demo. CI and manual draft
 packaging workflows are present; creating them is not evidence they ran remotely.
 
+The local engine now requires an explicit disposable-copy acknowledgement for
+apply and rollback. Permission/executable-bit restoration is not implemented;
+primary working trees are forbidden in this beta. Preview metadata and its event
+are transactionally committed, with fault-injection rollback coverage.
+
 Remaining beyond this local content-sync beta:
 
 - Remote-machine transport, pairing/identity and cloud-object adapters.

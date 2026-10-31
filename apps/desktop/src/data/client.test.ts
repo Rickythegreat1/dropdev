@@ -10,12 +10,22 @@ beforeEach(resetDemo);
 const preview = () =>
   command<Plan>({ action: "preview", pair_id: "demo-pair" });
 const apply = (plan: Plan) =>
-  command<Receipt>({ action: "apply", plan_id: plan.id, approval: plan.id });
+  command<Receipt>({
+    action: "apply",
+    plan_id: plan.id,
+    approval: plan.id,
+    disposable_copies: true,
+  });
 test("browser demo requires exact approval and repeated apply is idempotent", async () => {
   const plan = await preview();
   expect(plan.operations).toHaveLength(2);
   await expect(
-    command({ action: "apply", plan_id: plan.id, approval: "other-plan" }),
+    command({
+      action: "apply",
+      plan_id: plan.id,
+      approval: "other-plan",
+      disposable_copies: true,
+    }),
   ).rejects.toThrow("Explicit approval");
   expect((await apply(plan)).changed).toHaveLength(2);
   expect((await apply(plan)).changed).toHaveLength(0);
@@ -61,4 +71,21 @@ test("demo metadata survives a module restart", async () => {
   expect(
     state.plans.some((p) => p.id === plan.id && p.state === "verified"),
   ).toBe(true);
+});
+
+test("beta apply and rollback refuse missing or false disposable-copy confirmation without changes", async () => {
+  const plan = await preview();
+  for (const action of ["apply", "rollback"]) {
+    for (const disposable_copies of [undefined, false, "true"]) {
+      await expect(
+        command({
+          action,
+          plan_id: plan.id,
+          approval: plan.id,
+          disposable_copies,
+        }),
+      ).rejects.toThrow("Beta apply requires confirmation");
+    }
+  }
+  expect((await preview()).target_scan).toEqual({});
 });

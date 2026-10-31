@@ -170,3 +170,41 @@ no retry or workaround was attempted. CI is enabled on codex branches and calls
 unsigned artifact-only packaging on public-repository pushes. A first remote
 workflow validation failure was corrected by moving draft publication into a
 separate manual workflow with its own write permission. Exact remote results are recorded with the portable handoff artifact.
+
+## 2026-10-31 — Independent audit correction and disposable-copy gate
+
+1. **Task/scope.** Correct the preview/event atomicity defect independently found
+   at `4852013`, and enforce a clear disposable-copy-only beta boundary while
+   permission/executable-bit restoration remains unsupported. Touched local
+   runtime/tests, CLI request/help/process tests, desktop adapter/approval/banner
+   and tests, MCP warning envelope, review and behavior docs.
+2. **Risk/gates.** High-risk metadata consistency and apply approval. Inject a
+   SQLite trigger failure after plan insertion and prove no orphan plan/event
+   survives, including restart. Require exact boolean acknowledgement in the
+   Rust public API and both dispatch aliases; UI/CLI alone are insufficient.
+3. **Implementation.** `new_plan` now commits the saved plan and preview event in
+   one transaction. Plans carry a fixed beta warning, and approved events record
+   disposable-copy acknowledgement. Missing/false/non-boolean acknowledgements
+   refuse apply and rollback. CLI requires `--disposable-copies`; native/browser
+   adapters require explicit confirmation, and every screen warns against primary
+   working trees. The acknowledgement declares intent and does not verify or
+   sandbox root directories. Byte-only restore still does not preserve file
+   permissions, executable bits, ownership or ACLs.
+4. **Verification.** The injected-event regression failed against the earlier
+   code with an orphan plan and passed after the transaction fix. Full local Rust
+   run: 103 passed (14 legacy CLI, 3 process CLI, 47 core, 9 safety regressions,
+   21 daemon, 8 MCP library/protocol, 1 MCP process). Desktop: 15 tests, typecheck,
+   production build and real Chromium smoke passed. Rust formatting/all-target
+   checking and optimized builds passed. The new platform CI result is recorded
+   in the updated portable handoff; prior `4852013` artifacts are superseded.
+5. **Reviews.** Independent sync review verified the transaction and core gate,
+   corrected its premature earlier atomicity claim, and retained the explicit
+   metadata limitation. Desktop UX/aesthetic review verified persistent warning,
+   exact-plan-plus-disposable confirmation, disabled apply before confirmation,
+   recovery guidance and browser-only truthfulness. No primary-worktree safety
+   signoff or permission-preservation claim is made.
+6. **Closeout.** Update the same Library handoff with the new source and final CI
+   evidence. Hosting stays blocked on the supported Sites helper, existing private
+   project identity unchanged. Draft PR creation remains denied pending explicit
+   user permission; no retry. No real user directories, Docker, paid resources,
+   persistent credentials or new hosting routes were used.

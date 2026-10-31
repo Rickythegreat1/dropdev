@@ -179,7 +179,7 @@ impl<F: FnMut(Value) -> Result<Value, String>> Server<F> {
                 match (self.runtime)(runtime_request) {
                     Ok(value) => {
                         let evidence = json!({"evidence":agent_view(&value), "workspace_files_mutated":false,
-                            "local_metadata_may_change":true,"object_cache_may_change":needs_pair});
+                            "local_metadata_may_change":true,"object_cache_may_change":needs_pair,"beta_warning":devdrop_core::local::BETA_WARNING});
                         json!({"content":[{"type":"text","text":serde_json::to_string(&evidence).expect("metadata serializes")}],"isError":false})
                     }
                     Err(_) => {
@@ -285,6 +285,9 @@ mod tests {
         assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 4);
         let reply=server.handle(json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"workspace_status","arguments":{}}})).unwrap();
         let text = reply.to_string();
+        let evidence: Value =
+            serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(evidence["beta_warning"], devdrop_core::local::BETA_WARNING);
         assert!(text.contains("pair:1"));
         for forbidden in ["DO_NOT_LEAK", "/private/", "file_contents", "private"] {
             assert!(!text.contains(forbidden));
