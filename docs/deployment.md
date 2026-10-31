@@ -135,3 +135,9 @@ jobs because a skipped draft-release job still requested write permissions from
 a read-only reusable-workflow caller. Draft publication was split into its own
 manual workflow; the reused packaging workflow now requests read-only access.
 The initial failed run is `41242515367`; follow the latest branch run for checks.
+
+The next platform run exposed a pre-existing package-manager mismatch:
+`pnpm-workspace.yaml` uses workspace overrides understood by pnpm 11, while
+package.json declared pnpm 9. The declared manager is now pinned to the tested
+pnpm 11.19.0, so frozen installs consume the same override configuration as the
+local build. Do not treat the earlier pnpm-install failures as OS build results.
