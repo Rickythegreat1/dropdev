@@ -19,7 +19,7 @@ test("preview needs a separate explicit approval and displays an honest receipt"
     screen.getByRole("note", { name: "Beta safety limit" }).textContent,
   ).toContain("Never register or sync primary working trees");
   expect(screen.getByRole("checkbox").parentElement?.textContent).toContain(
-    "permissions or executable bits",
+    "only supported Unix rwx bits or Windows readonly are preserved",
   );
   expect(screen.getByText("src/notes.ts")).toBeTruthy();
   await user.click(screen.getByRole("checkbox"));

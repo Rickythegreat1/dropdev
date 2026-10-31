@@ -7,6 +7,7 @@ use std::path::Path;
 
 pub const MAX_MESSAGE_BYTES: usize = 256 * 1024;
 pub const PROTOCOL_VERSION: &str = "2024-11-05";
+pub const PERMISSION_SCOPE: &str = "Unix: basic rwx bits for files owned by the current user and primary group; special bits, custom ACLs and extended attributes are blocked. Windows: readonly only in current-user private directories with canonical owner/SYSTEM/Admin full-control rules; custom ACLs are blocked. Rollback retains original inode metadata. Permission widening requires separate approval in the local desktop or CLI.";
 
 fn error(id: Value, code: i64, message: &str) -> Value {
     json!({"jsonrpc":"2.0", "id":id, "error":{"code":code,"message":message}})
@@ -15,7 +16,7 @@ fn error(id: Value, code: i64, message: &str) -> Value {
 pub fn tools() -> Value {
     let description = [
         ("workspace_status", "Read durable pair IDs and plan states; no local paths or file text.", None),
-        ("sync_preview", "Reconcile registered roots and record a dry-run plan; never apply. Writes local plan metadata and eligible content objects.", Some("pair_id")),
+        ("sync_preview", "Reconcile registered roots and record a dry-run plan, including supported permission metadata and widening flags; never apply. Writes local plan metadata and eligible content objects.", Some("pair_id")),
         ("event_log", "Read event IDs, operation kinds and receipt states without paths or file text.", None),
         ("agent_handoff", "Scan and return redacted workspace evidence. May populate local object-cache metadata; never modify workspace files or start an agent.", Some("pair_id")),
     ];
@@ -31,6 +32,24 @@ pub fn tools() -> Value {
     }).collect())
 }
 
+/// Only supported flags cross this boundary; ACLs, SIDs and guard hashes do not.
+fn permission_view(value: &Value) -> Value {
+    match value.get("platform").and_then(Value::as_str) {
+        Some("unix") => value
+            .get("mode")
+            .and_then(Value::as_u64)
+            .filter(|mode| *mode <= 0o777)
+            .map(|mode| json!({"platform":"unix","mode":mode}))
+            .unwrap_or(Value::Null),
+        Some("windows") => value
+            .get("readonly")
+            .and_then(Value::as_bool)
+            .map(|readonly| json!({"platform":"windows","readonly":readonly}))
+            .unwrap_or(Value::Null),
+        _ => Value::Null,
+    }
+}
+
 /// Drop roots, names, relative paths, scan-map keys and future fields until reviewed.
 fn agent_view(value: &Value) -> Value {
     match value {
@@ -38,15 +57,27 @@ fn agent_view(value: &Value) -> Value {
         Value::Object(map) => {
             let mut safe = serde_json::Map::new();
             for (key, value) in map {
-                if matches!(
+                if matches!(key.as_str(), "permissions_before" | "permissions_after") {
+                    safe.insert(key.clone(), permission_view(value));
+                } else if key == "permission_widening" {
+                    if let Some(widening) = value.as_bool() {
+                        safe.insert(key.clone(), json!(widening));
+                    }
+                } else if matches!(key.as_str(), "before" | "after") {
+                    if value.is_null()
+                        || value.as_str().is_some_and(|hash| {
+                            hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+                        })
+                    {
+                        safe.insert(key.clone(), value.clone());
+                    }
+                } else if matches!(
                     key.as_str(),
                     "id" | "pair_id"
                         | "plan_id"
                         | "state"
                         | "kind"
                         | "side"
-                        | "before"
-                        | "after"
                         | "sequence"
                         | "seq"
                         | "revision"
@@ -58,7 +89,14 @@ fn agent_view(value: &Value) -> Value {
                         | "blocked"
                         | "ready"
                 ) {
-                    safe.insert(key.clone(), value.clone());
+                    // Runtime model changes must not smuggle nested raw data through a scalar field.
+                    if value.is_string()
+                        || value.is_number()
+                        || value.is_boolean()
+                        || value.is_null()
+                    {
+                        safe.insert(key.clone(), value.clone());
+                    }
                 } else if matches!(
                     key.as_str(),
                     "pairs" | "plans" | "events" | "operations" | "pending" | "evidence"
@@ -178,7 +216,7 @@ impl<F: FnMut(Value) -> Result<Value, String>> Server<F> {
                 }
                 match (self.runtime)(runtime_request) {
                     Ok(value) => {
-                        let evidence = json!({"evidence":agent_view(&value), "workspace_files_mutated":false,
+                        let evidence = json!({"evidence":agent_view(&value), "workspace_files_mutated":false,"permission_scope":PERMISSION_SCOPE,
                             "local_metadata_may_change":true,"object_cache_may_change":needs_pair,"beta_warning":devdrop_core::local::BETA_WARNING});
                         json!({"content":[{"type":"text","text":serde_json::to_string(&evidence).expect("metadata serializes")}],"isError":false})
                     }
@@ -263,7 +301,7 @@ mod tests {
     fn initialization_listing_calls_and_notifications() {
         let mut server = Server::new(|_| {
             Ok(
-                json!({"pairs":[{"id":"pair:1","source":"/private/source","target":"/private/target","name":"private"}],"secret":"DO_NOT_LEAK","file_contents":"DO_NOT_LEAK"}),
+                json!({"pairs":[{"id":"pair:1","source":"/private/source","target":"/private/target","name":"PRIVATE_PROJECT_NAME_CANARY"}],"secret":"DO_NOT_LEAK","file_contents":"DO_NOT_LEAK"}),
             )
         });
         assert_eq!(
@@ -289,7 +327,12 @@ mod tests {
             serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
         assert_eq!(evidence["beta_warning"], devdrop_core::local::BETA_WARNING);
         assert!(text.contains("pair:1"));
-        for forbidden in ["DO_NOT_LEAK", "/private/", "file_contents", "private"] {
+        for forbidden in [
+            "DO_NOT_LEAK",
+            "/private/",
+            "file_contents",
+            "PRIVATE_PROJECT_NAME_CANARY",
+        ] {
             assert!(!text.contains(forbidden));
         }
     }
@@ -312,6 +355,60 @@ mod tests {
         let value=server.handle(json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"sync_preview","arguments":{"pair_id":"pair:1"}}})).unwrap();
         assert_eq!(value["result"]["isError"], true);
         assert!(!value.to_string().contains("/private/"));
+    }
+
+    #[test]
+    fn permission_evidence_exposes_only_supported_flags() {
+        let mut server = Server::new(|_| {
+            Ok(json!({"operations":[
+                {"kind":"permissions","permissions_before":{"platform":"unix","mode":384,"acl":"ACL_CANARY","guard_hash":"GUARD_CANARY"},
+                 "permissions_after":{"platform":"unix","mode":493,"owner":"OWNER_CANARY"},"permission_widening":true},
+                {"permissions_before":{"platform":"windows","readonly":true,"sid":"SID_CANARY"},"permissions_after":{"platform":"windows","readonly":false},"permission_widening":false},
+                {"permissions_after":{"platform":"unix","mode":4095},"permission_widening":"FLAG_CANARY"},
+                {"permissions_after":{"platform":"unsupported","mode":420,"details":"DETAIL_CANARY"},"before":{"acl":"NESTED_CANARY"},"after":"RAW_TEXT_CANARY"}
+            ]}))
+        });
+        server.handle(init());
+        let reply=server.handle(json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"sync_preview","arguments":{"pair_id":"pair-1"}}})).unwrap();
+        let payload: Value =
+            serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        let operations = &payload["evidence"]["operations"];
+        assert_eq!(
+            operations[0]["permissions_before"],
+            json!({"platform":"unix","mode":384})
+        );
+        assert_eq!(
+            operations[0]["permissions_after"],
+            json!({"platform":"unix","mode":493})
+        );
+        assert_eq!(operations[0]["permission_widening"], true);
+        assert_eq!(
+            operations[1]["permissions_before"],
+            json!({"platform":"windows","readonly":true})
+        );
+        assert_eq!(
+            operations[1]["permissions_after"],
+            json!({"platform":"windows","readonly":false})
+        );
+        assert_eq!(operations[2]["permissions_after"], Value::Null);
+        assert!(operations[2].get("permission_widening").is_none());
+        assert_eq!(operations[3]["permissions_after"], Value::Null);
+        assert!(operations[3].get("before").is_none());
+        assert!(operations[3].get("after").is_none());
+        assert_eq!(payload["permission_scope"], PERMISSION_SCOPE);
+        assert_eq!(payload["workspace_files_mutated"], false);
+        for forbidden in [
+            "ACL_CANARY",
+            "GUARD_CANARY",
+            "OWNER_CANARY",
+            "SID_CANARY",
+            "FLAG_CANARY",
+            "DETAIL_CANARY",
+            "NESTED_CANARY",
+            "RAW_TEXT_CANARY",
+        ] {
+            assert!(!payload.to_string().contains(forbidden));
+        }
     }
 
     #[test]

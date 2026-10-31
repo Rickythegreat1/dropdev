@@ -21,6 +21,7 @@ test("native adapter sends exact approved plan to Tauri IPC without a network en
     plan_id: "plan-exact",
     approval: "plan-exact",
     disposable_copies: true,
+    allow_permission_widening: true,
   });
   expect(invoke).toHaveBeenCalledWith("local_command", {
     request: {
@@ -28,6 +29,7 @@ test("native adapter sends exact approved plan to Tauri IPC without a network en
       plan_id: "plan-exact",
       approval: "plan-exact",
       disposable_copies: true,
+      allow_permission_widening: true,
     },
   });
 });

@@ -1,5 +1,8 @@
 # Local MVP desktop review — 2026-10-31
 
+This file retains historical checkpoints. The latest supported-permission section
+supersedes earlier byte-only warnings; primary working trees remain prohibited.
+
 Task: replace all ten foundation route placeholders with a usable local sync
 control surface and an explicitly disposable browser demonstration.
 
@@ -80,5 +83,35 @@ native apply; native UI keeps apply disabled until explicit acknowledgement,
 sends the acknowledged flag, and keeps the warning visible through registration,
 recovery and overview navigation. The real-browser test checks the persistent
 warning and confirmation text along with the existing approval/recovery checks.
-Permission or executable-bit preservation is deliberately unimplemented, and these
-checks do not establish suitability for primary working trees.
+That content-only limitation is superseded by the supported-permission follow-up below. These checks do not establish suitability for primary working trees.
+
+
+## Supported permissions and separate access approval
+
+The persistent beta warning and disposable-copy acknowledgement now describe the
+supported permission contract: Unix rwx bits and Windows readonly are preserved;
+ACLs, foreign ownership, xattrs and special bits remain unsupported or blocked.
+Windows has no equivalent Unix executable bit. Primary working trees remain
+forbidden. This supersedes the earlier content-only limitation.
+
+Every operation exposes before and after permission evidence in the exact preview.
+Unix modes are octal (`0644 → 0755`); Windows displays `read-only → writable`.
+An operation tagged `permission_widening` visibly names the access increase and
+requires a second, initially unchecked acknowledgement, “I approve the listed
+access increases.” Both acknowledgements reset when the plan changes. Apply sends
+`disposable_copies` and `allow_permission_widening` from their respective checked
+states, and runtime approval remains authoritative. Missing metadata is labelled
+“Not recorded” rather than inferred. No permission operation runs through HTTP.
+
+The browser adapter still changes virtual state only. Its versioned disposable
+demo now models basic modes, permission-only changes, stale metadata scans,
+separate widening approval and recovery of the prior mode. Demo edits never use
+device files or claim native platform verification.
+
+Passed: TypeScript checking, Vite production build, 18 Vitest tests and real
+Chromium smoke. New cases verify Unix and Windows evidence labels; separate
+widening approval, request binding and reset on new previews; metadata-only
+staleness; and widening refusal with the prior mode preserved until approval.
+The browser smoke repeats preview/approval/apply/recovery and adds the executable
+permission simulation plus acknowledgement reset. Native permission/ACL handling
+and per-platform packaging validation belong to the Rust/platform test report.

@@ -208,3 +208,44 @@ separate manual workflow with its own write permission. Exact remote results are
    project identity unchanged. Draft PR creation remains denied pending explicit
    user permission; no retry. No real user directories, Docker, paid resources,
    persistent credentials or new hosting routes were used.
+
+## 2026-10-31 — Supported file permissions and retained-inode rollback
+
+1. **Task/scope.** User approved permission/executable-flag preservation. Add
+   platform permission inspection/application, source-mode previews/baselines,
+   metadata staleness, extra access-increase approval and exact original inode
+   rollback. Touched core runtime/module/tests/dependencies, CLI/MCP adapters,
+   desktop previews/approvals/demo/tests, lockfiles and permission/docs reviews.
+2. **Risk/gates.** High-risk filesystem/security metadata. Disposable-copy intent
+   remains required and does not prove a sandbox. Do not alter production ACLs,
+   ownership or privileges. Only constrained supported access policies pass;
+   separate exact-plan consent covers every access increase, including rollback.
+3. **Implementation.** Unix ordinary0777 rwx and Windows read-only are captured
+   with inode/security guards. Plain same-owner/group Unix files exclude special
+   bits/ACL/xattrs. Windows requires canonical current-owner private DACL and
+   supported integrity; streams/EAs/custom policies fail closed. Incoming data is
+   private at creation and gets verified final flags before no-clobber linking.
+   Mode-only changes are explicit operations. Rollback validates and relinks the
+   original retained inode, never recreating old permissions from CAS defaults.
+   Source/destination/directory identity and permissions guard stale plans. State
+   schema2 adds permission baselines; legacy byte-only plans refuse mutation.
+4. **Validation.** Local workspace: 122 Rust tests passed (14 CLI unit, 4 CLI process,
+   52 core unit, 12 independent permission, 9 security, 21 daemon, 9 MCP unit, 1 MCP process).
+   UI: 18 tests/typecheck/production build and expanded real Chromium smoke passed.
+   Formatter/all-target checks and optimized builds run before publication. Linux
+   behavior is tested; Windows module cross-compilation passed, while actual
+   Windows/mac platform results are recorded in the updated CI handoff.
+5. **Review corrections.** Tests caught Linux O_PATH descriptors unsuitable for
+   ACL/xattr queries; readable captured-directory handles fixed it without
+   weakening errors. Guards now include stable identities. Restore verifies full
+   retained/installed guards across the link boundary. Cache/state ACLs are
+   constrained before content writes, incoming identity is durably recorded
+   before linking, and special/private creation modes apply before any bytes.
+   Independent review passed the Linux permission suite; see permissions-review.
+6. **Limitations/closeout.** Ordinary source flags are preserved; complete ACL,
+   ownership, audit-SACL, xattr and timestamp replication is not implemented.
+   Windows audit-only SACLs are not queried/copied without additional privileges;
+   no privilege is enabled. Primary trees remain prohibited. Preserve original
+   evidence on recovery refusals. Same Library handoff will carry new source and
+   final platform artifacts. No PR retry, new credentials, Docker, hosting route,
+   real project mutation or paid resources were used.

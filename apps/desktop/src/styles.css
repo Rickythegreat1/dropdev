@@ -1061,3 +1061,22 @@ td {
     padding-right: 20px;
   }
 }
+
+.permissionPreview {
+  min-width: 200px;
+}
+.permissionPreview code {
+  display: block;
+  line-height: 1.7;
+}
+.accessIncrease {
+  display: block;
+  color: #85542d;
+  font-size: 0.68rem;
+  line-height: 1.6;
+  margin-top: 5px;
+  font-weight: 600;
+}
+.accessApproval {
+  margin-bottom: 20px;
+}

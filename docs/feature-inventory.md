@@ -130,8 +130,10 @@ The browser app runs a clearly labelled virtual-data demo. CI and manual draft
 packaging workflows are present; creating them is not evidence they ran remotely.
 
 The local engine now requires an explicit disposable-copy acknowledgement for
-apply and rollback. Permission/executable-bit restoration is not implemented;
-primary working trees are forbidden in this beta. Preview metadata and its event
+apply and rollback. Unix rwx and Windows read-only flags are now previewed, guarded and preserved;
+rollback relinks original destination inodes. Unsupported metadata is constrained
+or blocked, and access increases need separate approval. Primary working trees
+remain forbidden in this beta. Preview metadata and its event
 are transactionally committed, with fault-injection rollback coverage.
 
 Remaining beyond this local content-sync beta:
@@ -140,7 +142,7 @@ Remaining beyond this local content-sync beta:
 - Live hydration outside the existing bounded sandbox simulation.
 - Env key/runtime availability inventory and automated environment provisioning.
 - Task-scoped agent workspace execution; handoff remains a redacted contract.
-- File metadata/executable-bit synchronization, symlinks, empty directories.
+- Full security-descriptor/ownership/xattr/timestamp replication, symlinks and empty directories.
 - OS installer validation, signing and physical power-loss testing.
 - Verified hosting publication (supported Sites source helper missing here).
 

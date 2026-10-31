@@ -1,10 +1,16 @@
 import { invoke } from "@tauri-apps/api/core";
 
 export type Pair = { id: string; name: string; source: string; target: string };
+export type FilePermissions =
+  | { platform: "unix"; mode: number }
+  | { platform: "windows"; readonly: boolean };
 export type Operation = {
   side?: "source" | "target";
   path: string;
-  kind: "copy" | "replace" | "delete" | "conflict";
+  kind: "copy" | "replace" | "delete" | "conflict" | "permissions";
+  permissions_before?: FilePermissions | null;
+  permissions_after?: FilePermissions | null;
+  permission_widening?: boolean;
   before: string | null;
   after: string | null;
 };
@@ -18,6 +24,9 @@ export type Plan = {
   target_scan?: Record<string, string>;
   rollback_of?: string;
   reverses?: string | null;
+  metadata_version?: number;
+  source_permissions?: Record<string, FilePermissions>;
+  target_permissions?: Record<string, FilePermissions>;
 };
 export type Event = {
   id?: number | string;
@@ -42,13 +51,17 @@ export type Receipt = {
 export type Request = { action: string; [key: string]: unknown };
 export const native =
   typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
-const STORE = "devdrop-disposable-demo-v1";
+const STORE = "devdrop-disposable-demo-v2";
 type Demo = Registry & {
   revision: number;
   source: Record<string, string>;
   target: Record<string, string>;
   baseline: Record<string, string>;
   before: Record<string, Record<string, string>>;
+  source_permissions: Record<string, FilePermissions>;
+  target_permissions: Record<string, FilePermissions>;
+  baseline_permissions: Record<string, FilePermissions>;
+  before_permissions: Record<string, Record<string, FilePermissions>>;
 };
 const fresh = (): Demo => ({
   pairs: [
@@ -66,6 +79,13 @@ const fresh = (): Demo => ({
   target: {},
   baseline: {},
   before: {},
+  source_permissions: {
+    "README.md": { platform: "unix", mode: 0o644 },
+    "src/notes.ts": { platform: "unix", mode: 0o644 },
+  },
+  target_permissions: {},
+  baseline_permissions: {},
+  before_permissions: {},
 });
 function load(): Demo {
   try {
@@ -80,6 +100,10 @@ function load(): Demo {
         data.target &&
         data.baseline &&
         data.before &&
+        data.source_permissions &&
+        data.target_permissions &&
+        data.baseline_permissions &&
+        data.before_permissions &&
         Number.isFinite(data.revision)
       )
         return data;
@@ -104,6 +128,17 @@ export function resetDemo() {
 function same(a: unknown, b: unknown) {
   return JSON.stringify(a) === JSON.stringify(b);
 }
+function widens(before: FilePermissions | null, after: FilePermissions | null) {
+  if (!before || !after || before.platform !== after.platform) return false;
+  if (before.platform === "unix" && after.platform === "unix")
+    return (after.mode & ~before.mode) !== 0;
+  return (
+    before.platform === "windows" &&
+    after.platform === "windows" &&
+    before.readonly &&
+    !after.readonly
+  );
+}
 function event(state: Demo, kind: string, plan_id?: string) {
   state.events.push({ id: state.events.length + 1, kind, plan_id });
 }
@@ -113,7 +148,7 @@ export async function command<T>(request: Request): Promise<T> {
     request.disposable_copies !== true
   ) {
     throw new Error(
-      "Beta apply requires confirmation of disposable project copies only. Primary working trees are forbidden; permissions and executable bits are not preserved.",
+      "Beta apply requires confirmation of disposable project copies only. Primary working trees are forbidden. Only supported Unix rwx bits or Windows readonly are preserved; ACLs, ownership and xattrs are unsupported or blocked.",
     );
   }
   if (native) return invoke<T>("local_command", { request });
@@ -148,16 +183,44 @@ export async function command<T>(request: Request): Promise<T> {
         const after = d.source[path] ?? null,
           before = d.target[path] ?? null,
           base = d.baseline[path] ?? null;
-        if (after === before) return [];
+        const permissions_after =
+          after === null
+            ? null
+            : (d.source_permissions[path] ?? {
+                platform: "unix" as const,
+                mode: 0o644,
+              });
+        const permissions_before =
+          before === null
+            ? null
+            : (d.target_permissions[path] ?? {
+                platform: "unix" as const,
+                mode: 0o644,
+              });
+        const metadataSame = same(permissions_before, permissions_after);
+        if (after === before && metadataSame) return [];
         const kind =
-          before !== base
+          before !== base ||
+          !same(permissions_before, d.baseline_permissions[path] ?? null)
             ? "conflict"
             : after === null
               ? "delete"
               : before === null
                 ? "copy"
-                : "replace";
-        return [{ path, kind, before, after }];
+                : after === before
+                  ? "permissions"
+                  : "replace";
+        return [
+          {
+            path,
+            kind,
+            before,
+            after,
+            permissions_before,
+            permissions_after,
+            permission_widening: widens(permissions_before, permissions_after),
+          },
+        ];
       });
       const plan: Plan = {
         id: `demo-plan-${++d.revision}`,
@@ -171,6 +234,9 @@ export async function command<T>(request: Request): Promise<T> {
           : [],
         source_scan: { ...d.source },
         target_scan: { ...d.target },
+        metadata_version: 1,
+        source_permissions: { ...d.source_permissions },
+        target_permissions: { ...d.target_permissions },
       };
       d.plans.push(plan);
       event(d, "planned", plan.id);
@@ -189,7 +255,17 @@ export async function command<T>(request: Request): Promise<T> {
         .flatMap((path) => {
           const beforeHash = d.target[path] ?? null,
             afterHash = after[path] ?? null;
-          if (beforeHash === afterHash) return [];
+          const permissions_before =
+            beforeHash === null ? null : (d.target_permissions[path] ?? null);
+          const permissions_after =
+            afterHash === null
+              ? null
+              : (d.before_permissions[original.id]?.[path] ?? null);
+          if (
+            beforeHash === afterHash &&
+            same(permissions_before, permissions_after)
+          )
+            return [];
           return [
             {
               path,
@@ -198,7 +274,15 @@ export async function command<T>(request: Request): Promise<T> {
                   ? "delete"
                   : beforeHash === null
                     ? "copy"
-                    : "replace",
+                    : beforeHash === afterHash
+                      ? "permissions"
+                      : "replace",
+              permissions_before,
+              permissions_after,
+              permission_widening: widens(
+                permissions_before,
+                permissions_after,
+              ),
               before: beforeHash,
               after: afterHash,
             },
@@ -212,6 +296,9 @@ export async function command<T>(request: Request): Promise<T> {
         state: "planned",
         source_scan: { ...d.source },
         target_scan: { ...d.target },
+        metadata_version: 1,
+        source_permissions: { ...d.source_permissions },
+        target_permissions: { ...d.target_permissions },
         rollback_of: original.id,
       };
       d.plans.push(plan);
@@ -224,6 +311,14 @@ export async function command<T>(request: Request): Promise<T> {
       const plan = d.plans.find((p) => p.id === request.plan_id);
       if (!plan || request.approval !== plan.id)
         throw new Error("Explicit approval must match this plan ID.");
+      if (
+        plan.operations.some((o) => o.permission_widening) &&
+        request.allow_permission_widening !== true
+      ) {
+        throw new Error(
+          "Listed access increases require separate explicit approval.",
+        );
+      }
       if (plan.state === "verified") {
         result = {
           plan_id: plan.id,
@@ -239,17 +334,24 @@ export async function command<T>(request: Request): Promise<T> {
         );
       if (
         !same(plan.source_scan, d.source) ||
-        !same(plan.target_scan, d.target)
+        !same(plan.target_scan, d.target) ||
+        !same(plan.source_permissions, d.source_permissions) ||
+        !same(plan.target_permissions, d.target_permissions)
       )
         throw new Error(
           "Stale plan: virtual folders changed. Build a fresh preview.",
         );
       d.before[plan.id] = { ...d.target };
+      d.before_permissions[plan.id] = { ...d.target_permissions };
       plan.operations.forEach((o) => {
         if (o.after === null) delete d.target[o.path];
         else d.target[o.path] = o.after;
+        if (o.permissions_after)
+          d.target_permissions[o.path] = o.permissions_after;
+        else delete d.target_permissions[o.path];
       });
       d.baseline = { ...d.target };
+      d.baseline_permissions = { ...d.target_permissions };
       plan.state = "verified";
       event(d, "verified", plan.id);
       result = {
@@ -260,6 +362,11 @@ export async function command<T>(request: Request): Promise<T> {
       };
       break;
     }
+    case "demo_permissions":
+      d.source_permissions["src/notes.ts"] = { platform: "unix", mode: 0o755 };
+      event(d, "virtual_source_permissions_changed");
+      result = {};
+      break;
     case "demo_edit":
       d.source["src/notes.ts"] = `demo-notes-v${++d.revision}`;
       event(d, "virtual_source_edited");
@@ -268,6 +375,10 @@ export async function command<T>(request: Request): Promise<T> {
     case "demo_conflict":
       d.source["src/notes.ts"] = `demo-source-v${++d.revision}`;
       d.target["src/notes.ts"] = `demo-replica-v${d.revision}`;
+      d.target_permissions["src/notes.ts"] ??= {
+        platform: "unix",
+        mode: 0o644,
+      };
       event(d, "virtual_both_sides_edited");
       result = {};
       break;

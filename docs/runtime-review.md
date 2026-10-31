@@ -1,5 +1,10 @@
 # Local runtime safety review — 2026-10-31
 
+This is the historical byte-only review. New permission-aware plans supersede
+its permission limitation; see [permission implementation review](permissions-review.md)
+and [supported access policy](file-permissions.md). Disposable-copy restrictions
+remain; no primary-worktree signoff is implied.
+
 Reviewed `crates/devdrop-core/src/local.rs`, the Tauri native bridge, and the
 new CLI/MCP adapters against `AGENTS.md`, `docs/sync-invariants.md`, and
 `skills/devdrop-sync-invariant-review/SKILL.md`.

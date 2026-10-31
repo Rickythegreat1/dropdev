@@ -1,5 +1,6 @@
 //! Durable local two-folder sync. No HTTP listener or remotely callable writes.
 //! Every apply consumes a persisted preview, an exact approval, and fresh scans.
+use crate::file_permissions::{self as access, AccessMetadata, FilePermissions};
 use cap_std::{ambient_authority, fs::Dir};
 use fs2::FileExt;
 use rusqlite::{params, Connection};
@@ -13,13 +14,36 @@ use std::{
     time::Duration,
 };
 
-/// This release copies bytes; it cannot promise permission/ACL restoration.
-pub const BETA_WARNING: &str = "DevDrop beta: use disposable project copies only. Do not use primary working trees. Replacement and rollback do not preserve file permissions or executable bits.";
+/// Supported basic permissions are preserved; unsupported metadata fails closed.
+pub const BETA_WARNING: &str = "DevDrop beta: use disposable project copies only. Do not use primary working trees. Unix rwx and Windows read-only flags are preserved; unsupported ACLs, ownership and extended attributes are blocked. Access increases require separate approval.";
 fn beta_warning() -> String {
     BETA_WARNING.to_owned()
 }
 
 type Snapshot = BTreeMap<String, String>;
+type PermissionMap = BTreeMap<String, FilePermissions>;
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetadataSnapshot {
+    pub files: BTreeMap<String, AccessMetadata>,
+    pub directories: BTreeMap<String, String>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ScanData {
+    hashes: Snapshot,
+    metadata: MetadataSnapshot,
+}
+impl std::ops::Deref for ScanData {
+    type Target = Snapshot;
+    fn deref(&self) -> &Snapshot {
+        &self.hashes
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetainedFile {
+    pub plan_id: String,
+    pub index: usize,
+}
+
 type Result<T> = std::result::Result<T, LocalError>;
 
 /// Errors are intentionally fixed messages: OS errors may include sensitive paths.
@@ -68,6 +92,16 @@ pub struct Operation {
     pub side: String,
     pub before: Option<String>,
     pub after: Option<String>,
+    #[serde(default)]
+    pub permissions_before: Option<FilePermissions>,
+    #[serde(default)]
+    pub permissions_after: Option<FilePermissions>,
+    #[serde(default)]
+    pub permission_widening: bool,
+    #[serde(default)]
+    pub private_parent_directories: Vec<String>,
+    #[serde(default)]
+    pub restore_from: Option<RetainedFile>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Plan {
@@ -82,6 +116,14 @@ pub struct Plan {
     pub target_scan: Snapshot,
     pub base_revision: i64,
     pub reverses: Option<String>,
+    #[serde(default)]
+    pub metadata_version: u32,
+    #[serde(default)]
+    pub source_metadata: Option<MetadataSnapshot>,
+    #[serde(default)]
+    pub target_metadata: Option<MetadataSnapshot>,
+    #[serde(default)]
+    pub applied_metadata: BTreeMap<String, AccessMetadata>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Receipt {
@@ -123,6 +165,8 @@ impl Engine {
                 fs::Permissions::from_mode(0o700),
             ))?;
         }
+        let state_dir = io(Dir::open_ambient_dir(&state, ambient_authority()))?;
+        access::inspect_directory(&directory_file(&state_dir)?).map_err(err)?;
         for child in [
             "writer.lock",
             "metadata.sqlite3",
@@ -131,6 +175,16 @@ impl Engine {
             "objects",
         ] {
             reject_symlinks(&state.join(child))?;
+        }
+        for child in [
+            "writer.lock",
+            "metadata.sqlite3",
+            "metadata.sqlite3-wal",
+            "metadata.sqlite3-shm",
+        ] {
+            if state.join(child).exists() {
+                access::inspect_file(&io(state_dir.open(child))?.into_std()).map_err(err)?;
+            }
         }
         let lock = io(OpenOptions::new()
             .create(true)
@@ -144,19 +198,23 @@ impl Engine {
         sql(db.busy_timeout(Duration::from_secs(5)))?;
         sql(db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;
           CREATE TABLE IF NOT EXISTS schema_version(version INTEGER NOT NULL);
-          INSERT INTO schema_version SELECT 1 WHERE NOT EXISTS(SELECT 1 FROM schema_version);
-          CREATE TABLE IF NOT EXISTS pairs(id TEXT PRIMARY KEY, body TEXT NOT NULL, baseline TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 0);
+          INSERT INTO schema_version SELECT 2 WHERE NOT EXISTS(SELECT 1 FROM schema_version);
+          CREATE TABLE IF NOT EXISTS pairs(id TEXT PRIMARY KEY, body TEXT NOT NULL, baseline TEXT NOT NULL, baseline_permissions TEXT NOT NULL DEFAULT '{}', revision INTEGER NOT NULL DEFAULT 0);
           CREATE TABLE IF NOT EXISTS plans(id TEXT PRIMARY KEY, pair_id TEXT NOT NULL REFERENCES pairs(id), body TEXT NOT NULL);
           CREATE TABLE IF NOT EXISTS events(seq INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, pair_id TEXT, plan_id TEXT, body TEXT NOT NULL);
         "))?;
         let version: i64 =
             sql(db.query_row("SELECT version FROM schema_version", [], |r| r.get(0)))?;
-        if version != 1 {
+        if version == 1 {
+            sql(db.execute_batch("BEGIN IMMEDIATE; ALTER TABLE pairs ADD COLUMN baseline_permissions TEXT NOT NULL DEFAULT '{}'; UPDATE schema_version SET version=2; COMMIT;"))?;
+        } else if version != 2 {
             return Err(err(
                 "Unsupported local metadata schema; upgrade DevDrop without deleting state.",
             ));
         }
         io(fs::create_dir_all(state.join("objects")))?;
+        access::inspect_directory(&directory_file(&io(state_dir.open_dir("objects"))?)?)
+            .map_err(err)?;
         sync_directory(&state)?;
         if let Some(parent) = state.parent() {
             sync_directory(parent)?;
@@ -255,16 +313,16 @@ impl Engine {
         let rows = sql(statement.query_map([], |r| r.get::<_, String>(0)))?;
         rows.map(|r| decode(&sql(r)?)).collect()
     }
-    fn pair(&self, id: &str) -> Result<(Pair, Snapshot, i64)> {
+    fn pair(&self, id: &str) -> Result<(Pair, Snapshot, PermissionMap, i64)> {
         if !valid_id(id) {
             return Err(err("Unknown project identifier."));
         }
-        let (p, b, r): (String, String, i64) = sql(self.db.query_row(
-            "SELECT body,baseline,revision FROM pairs WHERE id=?1",
+        let (p, b, m, r): (String, String, String, i64) = sql(self.db.query_row(
+            "SELECT body,baseline,baseline_permissions,revision FROM pairs WHERE id=?1",
             [id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         ))?;
-        Ok((decode(&p)?, decode(&b)?, r))
+        Ok((decode(&p)?, decode(&b)?, decode(&m)?, r))
     }
     fn plan(&self, id: &str) -> Result<Plan> {
         if !valid_id(id) {
@@ -332,20 +390,22 @@ impl Engine {
         }
         Ok(())
     }
-    fn scans(&self, p: &Pair) -> Result<(Snapshot, Snapshot)> {
+    fn scans(&self, p: &Pair) -> Result<(ScanData, ScanData)> {
         let mut source = self.scan(Path::new(&p.source))?;
         let mut target = self.scan(Path::new(&p.target))?;
         for path in union(&source, &target, &Snapshot::new()) {
             if excluded(Path::new(&p.source), &path)? || excluded(Path::new(&p.target), &path)? {
-                source.remove(&path);
-                target.remove(&path);
+                source.hashes.remove(&path);
+                target.hashes.remove(&path);
+                source.metadata.files.remove(&path);
+                target.metadata.files.remove(&path);
             }
         }
         Ok((source, target))
     }
     pub fn preview(&self, pair_id: &str) -> Result<Plan> {
         self.ensure_no_recovery(pair_id)?;
-        let (p, base, revision) = self.pair(pair_id)?;
+        let (p, base, base_permissions, revision) = self.pair(pair_id)?;
         let (s, t) = self.scans(&p)?;
         let mut ops = vec![];
         for path in union(&s, &t, &base) {
@@ -356,27 +416,33 @@ impl Engine {
             let a = s.get(&path);
             let b = t.get(&path);
             let old = base.get(&path);
-            if a == b {
+            let a_mode = s.metadata.files.get(&path).map(|m| m.permissions.clone());
+            let b_mode = t.metadata.files.get(&path).map(|m| m.permissions.clone());
+            if a == b && a_mode == b_mode {
                 continue;
             }
-            let kind = if b == old {
+            let kind = if b == old && b_mode.as_ref() == base_permissions.get(&path) {
                 if a.is_none() {
                     "delete"
                 } else if b.is_none() {
                     "copy"
+                } else if a == b {
+                    "permissions"
                 } else {
                     "replace"
                 }
             } else {
                 "conflict"
             };
-            ops.push(Operation {
+            ops.push(operation(
                 path,
-                kind: kind.into(),
-                side: "target".into(),
-                before: b.cloned(),
-                after: a.cloned(),
-            });
+                kind,
+                "target",
+                b.cloned(),
+                a.cloned(),
+                a_mode,
+                None,
+            ));
         }
         let blockers = if dirty_git(&p.source)? || dirty_git(&p.target)? {
             vec![
@@ -391,13 +457,54 @@ impl Engine {
     fn new_plan(
         &self,
         p: &Pair,
-        operations: Vec<Operation>,
-        source_scan: Snapshot,
-        target_scan: Snapshot,
+        mut operations: Vec<Operation>,
+        source_scan: ScanData,
+        target_scan: ScanData,
         base_revision: i64,
         reverses: Option<String>,
         blockers: Vec<String>,
     ) -> Result<Plan> {
+        for op in &mut operations {
+            let (local, incoming) = if op.side == "source" {
+                (&source_scan, &target_scan)
+            } else {
+                (&target_scan, &source_scan)
+            };
+            op.permissions_before = local
+                .metadata
+                .files
+                .get(&op.path)
+                .map(|m| m.permissions.clone());
+            if op.after.is_some() && op.permissions_after.is_none() {
+                op.permissions_after = incoming
+                    .metadata
+                    .files
+                    .get(&op.path)
+                    .map(|m| m.permissions.clone());
+            }
+            if op.after.is_some() && op.permissions_after.is_none() {
+                return Err(err(
+                    "A permission snapshot is required for every intended write.",
+                ));
+            }
+            if op.kind != "conflict"
+                && op.before.is_some()
+                && op.before == op.after
+                && op.permissions_before != op.permissions_after
+            {
+                op.kind = "permissions".into();
+            }
+            op.permission_widening = access::permission_widening(
+                op.permissions_before.as_ref(),
+                op.permissions_after.as_ref(),
+            );
+            if op.after.is_some() {
+                op.private_parent_directories = parent_paths(&op.path)
+                    .into_iter()
+                    .filter(|path| !local.metadata.directories.contains_key(path))
+                    .collect();
+            }
+        }
         let sequence: i64 =
             sql(self
                 .db
@@ -426,8 +533,12 @@ impl Engine {
             operations,
             state: "planned".into(),
             blockers,
-            source_scan,
-            target_scan,
+            source_scan: source_scan.hashes,
+            target_scan: target_scan.hashes,
+            source_metadata: Some(source_scan.metadata),
+            target_metadata: Some(target_scan.metadata),
+            metadata_version: 1,
+            applied_metadata: BTreeMap::new(),
             base_revision,
             reverses,
         };
@@ -447,7 +558,7 @@ impl Engine {
             .iter()
             .find(|o| o.path == path && o.kind == "conflict")
             .ok_or_else(|| err("The selected path is not an unresolved conflict."))?;
-        let (p, _, revision) = self.pair(pair_id)?;
+        let (p, _, _, revision) = self.pair(pair_id)?;
         let mut ops = vec![];
         match choice {
             "source" => ops.push(Operation {
@@ -460,6 +571,11 @@ impl Engine {
                 side: "source".into(),
                 before: conflict.after.clone(),
                 after: conflict.before.clone(),
+                permissions_after: conflict.permissions_before.clone(),
+                permissions_before: None,
+                permission_widening: false,
+                private_parent_directories: vec![],
+                restore_from: None,
             }),
             "both" => {
                 let other = conflict
@@ -477,13 +593,15 @@ impl Engine {
                     return Err(err("Conflict preservation path already exists; choose a side or rename locally and rescan."));
                 }
                 for side in ["source", "target"] {
-                    ops.push(Operation {
-                        path: sibling.clone(),
-                        kind: "copy".into(),
-                        side: side.into(),
-                        before: None,
-                        after: Some(other.clone()),
-                    });
+                    ops.push(operation(
+                        sibling.clone(),
+                        "copy",
+                        side,
+                        None,
+                        Some(other.clone()),
+                        conflict.permissions_before.clone(),
+                        None,
+                    ));
                 }
                 ops.push(Operation {
                     kind: kind(&conflict.before, &conflict.after).into(),
@@ -499,8 +617,8 @@ impl Engine {
         self.new_plan(
             &p,
             ops,
-            current.source_scan,
-            current.target_scan,
+            scan_from_plan(&current, "source")?,
+            scan_from_plan(&current, "target")?,
             revision,
             None,
             current.blockers,
@@ -508,7 +626,13 @@ impl Engine {
     }
     /// Apply is restricted to callers explicitly confirming disposable copies.
     /// This is an intent acknowledgement, not proof that a root is a sandbox.
-    pub fn apply(&self, id: &str, approval: &str, disposable_copies: bool) -> Result<Receipt> {
+    pub fn apply(
+        &self,
+        id: &str,
+        approval: &str,
+        disposable_copies: bool,
+        allow_permission_widening: bool,
+    ) -> Result<Receipt> {
         if !disposable_copies {
             if let Ok(plan) = self.plan(id) {
                 self.event(
@@ -520,6 +644,28 @@ impl Engine {
             }
             return Err(err(BETA_WARNING));
         }
+        let plan = self.plan(id)?;
+        for op in &plan.operations {
+            let before = scan_from_plan(&plan, &op.side)?;
+            let permissions = before.metadata.files.get(&op.path).map(|m| &m.permissions);
+            let widening = access::permission_widening(permissions, op.permissions_after.as_ref());
+            if before.get(&op.path) != op.before.as_ref()
+                || permissions != op.permissions_before.as_ref()
+                || op.after.is_some() != op.permissions_after.is_some()
+                || widening != op.permission_widening
+            {
+                return Err(err("Persisted operation permissions do not match their preview evidence; create a new plan."));
+            }
+        }
+        if plan.operations.iter().any(|o| o.permission_widening) && !allow_permission_widening {
+            self.event(
+                "refused",
+                &plan.pair_id,
+                id,
+                json!({"reason":"permission_widening_approval_required"}),
+            )?;
+            return Err(err("This preview increases access. Review permissions and explicitly approve with --allow-permission-widening."));
+        }
         self.apply_inner(id, approval, None)
     }
     fn apply_inner(
@@ -529,6 +675,12 @@ impl Engine {
         interrupt_after: Option<usize>,
     ) -> Result<Receipt> {
         let mut plan = self.plan(id)?;
+        if plan.metadata_version != 1
+            || plan.source_metadata.is_none()
+            || plan.target_metadata.is_none()
+        {
+            return Err(err("Legacy byte-only plans cannot be applied or rolled back. Preserve retained files and create a new permission-aware preview."));
+        }
         if approval != id {
             self.event(
                 "refused",
@@ -560,9 +712,12 @@ impl Engine {
         if plan.reverses.is_none() {
             self.ensure_no_recovery(&plan.pair_id)?;
         }
-        let (p, _, revision) = self.pair(&plan.pair_id)?;
+        let (p, _, _, revision) = self.pair(&plan.pair_id)?;
         let (s, t) = self.scans(&p)?;
-        if s != plan.source_scan || t != plan.target_scan || revision != plan.base_revision {
+        if s != scan_from_plan(&plan, "source")?
+            || t != scan_from_plan(&plan, "target")?
+            || revision != plan.base_revision
+        {
             self.event("refused", &p.id, id, json!({"reason":"stale_preview"}))?;
             return Err(err(
                 "Preview is stale; scan and preview again before approving.",
@@ -573,7 +728,7 @@ impl Engine {
                 "Git worktree changed; create a new preview after preserving local work.",
             ));
         }
-        self.event("approved", &p.id, id, json!({"approved_plan_id":id,"disposable_copies_acknowledged":true,"beta_warning":BETA_WARNING}))?;
+        self.event("approved", &p.id, id, json!({"approved_plan_id":id,"disposable_copies_acknowledged":true,"permission_widening_approved":plan.operations.iter().any(|op|op.permission_widening),"beta_warning":BETA_WARNING}))?;
         plan.state = "applying".into();
         self.save_plan(&plan)?;
         self.event(
@@ -583,7 +738,9 @@ impl Engine {
             json!({"recovery":"Use rollback_preview on this plan if interrupted."}),
         )?;
         let mut changed = vec![];
-        for (index, op) in plan.operations.iter().enumerate() {
+        let mut source_dirs = plan.source_metadata.as_ref().unwrap().directories.clone();
+        let mut target_dirs = plan.target_metadata.as_ref().unwrap().directories.clone();
+        for (index, op) in plan.operations.clone().iter().enumerate() {
             if interrupt_after == Some(index) {
                 return Err(err("Test interruption; recovery is required."));
             }
@@ -593,7 +750,20 @@ impl Engine {
                 }
                 self.event("tombstone",&p.id,id,json!({"operation":op,"origin":"approved_local_plan","restore_object":op.before,"approval":id}))?;
             }
-            let result = self.write_operation(&p, op, id, index);
+            let before = if op.side == "source" {
+                plan.source_metadata.as_ref()
+            } else {
+                plan.target_metadata.as_ref()
+            }
+            .unwrap()
+            .files
+            .get(&op.path);
+            let dirs = if op.side == "source" {
+                &mut source_dirs
+            } else {
+                &mut target_dirs
+            };
+            let result = self.write_operation_context(&p, op, id, index, before, dirs, |_| {});
             if result.is_err() {
                 plan.state = "recovery_required".into();
                 self.save_plan(&plan)?;
@@ -607,35 +777,66 @@ impl Engine {
                     "Apply interrupted. Preserve .devdrop-recovery-<plan-id>-<operation-index>/previous under the affected registered root; the event log names each directory. Create a rollback preview. If the preserved bytes changed, restore them manually first.",
                 ));
             }
+            let installed = result.unwrap();
+            if let Some(metadata) = &installed {
+                plan.applied_metadata
+                    .insert(format!("{}:{}", op.side, op.path), metadata.clone());
+            }
             changed.push(format!("{}:{}", op.side, op.path));
-            self.event(
-                "operation_verified",
-                &p.id,
-                id,
-                json!({"index":index,"operation":op}),
-            )?;
+            self.transaction(|| {
+                self.save_plan(&plan)?;
+                self.event(
+                    "operation_verified",
+                    &p.id,
+                    id,
+                    json!({"index":index,"operation":op,"installed_metadata":installed}),
+                )
+            })?;
         }
         let (after_s, after_t) = self.scans(&p)?;
         let mut expected_s = plan.source_scan.clone();
         let mut expected_t = plan.target_scan.clone();
+        let mut expected_sm = plan.source_metadata.as_ref().unwrap().files.clone();
+        let mut expected_tm = plan.target_metadata.as_ref().unwrap().files.clone();
         for op in &plan.operations {
-            let map = if op.side == "source" {
-                &mut expected_s
+            let (hashes, metadata) = if op.side == "source" {
+                (&mut expected_s, &mut expected_sm)
             } else {
-                &mut expected_t
+                (&mut expected_t, &mut expected_tm)
             };
-            set(map, &op.path, op.after.clone());
+            set(hashes, &op.path, op.after.clone());
+            if let Some(m) = plan
+                .applied_metadata
+                .get(&format!("{}:{}", op.side, op.path))
+            {
+                metadata.insert(op.path.clone(), m.clone());
+            } else {
+                metadata.remove(&op.path);
+            }
         }
-        if after_s != expected_s || after_t != expected_t {
+        validate_directories(Path::new(&p.source), &source_dirs)?;
+        validate_directories(Path::new(&p.target), &target_dirs)?;
+        if after_s.hashes != expected_s
+            || after_t.hashes != expected_t
+            || after_s.metadata.files != expected_sm
+            || after_t.metadata.files != expected_tm
+        {
             plan.state = "recovery_required".into();
             self.save_plan(&plan)?;
-            return Err(err("Final verification found changed files. Preserve work and create a rollback preview."));
+            return Err(err("Final content or permission verification failed. Preserve retained files and create a recovery preview."));
         }
-        // Commit completion, baseline, and replay receipt atomically. Applying was durable before mutation.
         let baseline: Snapshot = after_s
             .iter()
-            .filter(|(k, v)| after_t.get(*k) == Some(*v))
-            .map(|(k, v)| (k.clone(), v.clone()))
+            .filter(|(path, h)| {
+                after_t.get(*path) == Some(*h)
+                    && after_s.metadata.files.get(*path).map(|m| &m.permissions)
+                        == after_t.metadata.files.get(*path).map(|m| &m.permissions)
+            })
+            .map(|(p, h)| (p.clone(), h.clone()))
+            .collect();
+        let baseline_permissions: PermissionMap = baseline
+            .keys()
+            .map(|p| (p.clone(), after_s.metadata.files[p].permissions.clone()))
             .collect();
         plan.state = if plan.reverses.is_some() {
             "rolled_back"
@@ -646,8 +847,8 @@ impl Engine {
         sql(self.db.execute_batch("BEGIN IMMEDIATE"))?;
         let finish = (|| {
             sql(self.db.execute(
-                "UPDATE pairs SET baseline=?1,revision=revision+1 WHERE id=?2",
-                params![encode(&baseline)?, p.id],
+                "UPDATE pairs SET baseline=?1,baseline_permissions=?2,revision=revision+1 WHERE id=?3",
+                params![encode(&baseline)?,encode(&baseline_permissions)?,p.id],
             ))?;
             self.save_plan(&plan)?;
             for mut previous in self.plans()? {
@@ -661,7 +862,7 @@ impl Engine {
                 original.state = "rolled_back".into();
                 self.save_plan(&original)?;
             }
-            self.event("receipt",&p.id,id,json!({"state":plan.state,"changed":changed,"verified":true,"baseline":baseline,"revision":revision+1}))?;
+            self.event("receipt",&p.id,id,json!({"state":plan.state,"changed":changed,"verified":true,"baseline":baseline,"baseline_permissions":baseline_permissions,"verified_source_metadata":after_s.metadata,"verified_target_metadata":after_t.metadata,"revision":revision+1}))?;
             Ok(())
         })();
         match finish {
@@ -672,10 +873,118 @@ impl Engine {
             }
         }
         sql(self.db.execute_batch("PRAGMA wal_checkpoint(FULL)"))?;
-        Ok(Receipt{plan_id:id.into(),state:plan.state,changed,message:"Verified against fresh scans. Original bytes are retained in the local object store; rollback requires its own approved preview.".into()})
+        Ok(Receipt{plan_id:id.into(),state:plan.state,changed,message:"Verified bytes and supported permissions against fresh scans. Original inodes are retained; rollback requires its own approved preview and any access-increase approval.".into()})
+    }
+    fn retained_original(
+        &self,
+        p: &Pair,
+        reference: &RetainedFile,
+        path: &str,
+        side: &str,
+        expected_hash: &str,
+        expected_permissions: &FilePermissions,
+    ) -> Result<(String, AccessMetadata)> {
+        let original = self.plan(&reference.plan_id)?;
+        let op = original
+            .operations
+            .get(reference.index)
+            .ok_or_else(|| err("Invalid retained-file operation reference."))?;
+        if original.pair_id != p.id
+            || op.path != path
+            || op.side != side
+            || op.before.as_deref() != Some(expected_hash)
+            || op.permissions_before.as_ref() != Some(expected_permissions)
+        {
+            return Err(err(
+                "Retained-file provenance does not match the approved preview.",
+            ));
+        }
+        let snapshot = scan_from_plan(&original, side)?;
+        let expected = snapshot.metadata.files.get(path).ok_or_else(|| {
+            err("Original permission evidence is missing; preserve retained files.")
+        })?;
+        let relative = format!(
+            ".devdrop-recovery-{}-{}/previous",
+            original.id, reference.index
+        );
+        let root = Path::new(if side == "source" {
+            &p.source
+        } else {
+            &p.target
+        });
+        reject_symlinks(&root.join(&relative))?;
+        let dir = io(Dir::open_ambient_dir(root, ambient_authority()))?;
+        let actual = current_file(&dir, &relative)?.ok_or_else(|| {
+            err("Retained original inode is missing; automatic rollback is blocked.")
+        })?;
+        if actual.0 != expected_hash || &actual.1 != expected {
+            return Err(err("Retained original content, identity or permissions changed; automatic rollback is blocked."));
+        }
+        Ok((relative, actual.1))
+    }
+    fn incoming_evidence(
+        &self,
+        p: &Pair,
+        plan: &Plan,
+        index: usize,
+        op: &Operation,
+    ) -> Result<Option<AccessMetadata>> {
+        if op.after.is_none() {
+            return Ok(None);
+        }
+        if let Some(reference) = &op.restore_from {
+            let (_, metadata) = self.retained_original(
+                p,
+                reference,
+                &op.path,
+                &op.side,
+                op.after.as_deref().unwrap(),
+                op.permissions_after
+                    .as_ref()
+                    .ok_or_else(|| err("Restore permission evidence is missing."))?,
+            )?;
+            return Ok(Some(metadata));
+        }
+        let root = Path::new(if op.side == "source" {
+            &p.source
+        } else {
+            &p.target
+        });
+        let relative = format!(".devdrop-incoming-{}-{index}/file", plan.id);
+        reject_symlinks(&root.join(&relative))?;
+        let dir = io(Dir::open_ambient_dir(root, ambient_authority()))?;
+        let Some((hash, metadata)) = current_file(&dir, &relative)? else {
+            return Ok(None);
+        };
+        if Some(&hash) != op.after.as_ref()
+            || Some(&metadata.permissions) != op.permissions_after.as_ref()
+        {
+            return Err(err(
+                "Retained incoming content or permissions changed; automatic recovery is blocked.",
+            ));
+        }
+        let mut query=sql(self.db.prepare("SELECT body FROM events WHERE plan_id=?1 AND kind='incoming_prepared' ORDER BY seq DESC"))?;
+        let rows = sql(query.query_map([&plan.id], |r| r.get::<_, String>(0)))?;
+        let mut expected = None;
+        for row in rows {
+            let value: Value = decode(&sql(row)?)?;
+            if value["index"].as_u64() == Some(index as u64) {
+                expected = Some(
+                    serde_json::from_value::<AccessMetadata>(value["metadata"].clone())
+                        .map_err(|_| err("Prepared permission identity evidence is malformed."))?,
+                );
+                break;
+            }
+        }
+        if expected.as_ref() != Some(&metadata) {
+            return Err(err("Retained incoming identity or permissions no longer match their pre-install event."));
+        }
+        Ok(Some(metadata))
     }
     pub fn rollback_preview(&self, id: &str) -> Result<Plan> {
         let original = self.plan(id)?;
+        scan_from_plan(&original, "source")?;
+        scan_from_plan(&original, "target")?;
         if !matches!(
             original.state.as_str(),
             "verified" | "applying" | "recovery_required"
@@ -684,131 +993,236 @@ impl Engine {
                 "Only an applied or interrupted preview can be rolled back.",
             ));
         }
-        let (p, _, revision) = self.pair(&original.pair_id)?;
+        let (p, _, _, revision) = self.pair(&original.pair_id)?;
         let (s, t) = self.scans(&p)?;
         let mut ops = vec![];
         for (index, o) in original.operations.iter().enumerate().rev() {
-            let root_path = Path::new(if o.side == "source" {
+            let scan = if o.side == "source" { &s } else { &t };
+            let now = scan.get(&o.path).cloned();
+            let now_meta = scan.metadata.files.get(&o.path);
+            let before_scan = scan_from_plan(&original, &o.side)?;
+            let original_meta = before_scan.metadata.files.get(&o.path);
+            let reference = RetainedFile {
+                plan_id: id.into(),
+                index,
+            };
+            let root = Path::new(if o.side == "source" {
                 &p.source
             } else {
                 &p.target
             });
-            let stage = root_path.join(format!(".devdrop-recovery-{}-{index}", original.id));
-            let backup = stage.join("previous");
-            let staged = if stage.exists() {
-                reject_symlinks(&backup)?;
-                if backup.exists() {
-                    let d = io(Dir::open_ambient_dir(&stage, ambient_authority()))?;
-                    if current_hash(&d, "previous")? != o.before {
-                        return Err(err("New work was preserved in a .devdrop-recovery-* directory. Restore it manually before rollback."));
-                    }
-                    true
-                } else {
-                    false
-                }
+            let stage = root.join(format!(".devdrop-recovery-{id}-{index}/previous"));
+            let staged = if o.before.is_some() && stage.exists() {
+                self.retained_original(
+                    &p,
+                    &reference,
+                    &o.path,
+                    &o.side,
+                    o.before.as_deref().unwrap(),
+                    o.permissions_before
+                        .as_ref()
+                        .ok_or_else(|| err("Original supported permissions missing."))?,
+                )?;
+                true
             } else {
                 false
             };
-            let map = if o.side == "source" { &s } else { &t };
-            let now = map.get(&o.path).cloned();
-            if now == o.before {
+            if now == o.before && now_meta == original_meta {
                 continue;
             }
-            if now != o.after && !(staged && now.is_none()) {
-                return Err(err("Files changed after apply; rollback would overwrite new work. Preserve those files before retrying."));
+            let after_evidence = original
+                .applied_metadata
+                .get(&format!("{}:{}", o.side, o.path))
+                .cloned()
+                .or(self.incoming_evidence(&p, &original, index, o)?);
+            let after_matches = now == o.after
+                && match (&now_meta, &after_evidence) {
+                    (Some(actual), Some(expected)) => *actual == expected,
+                    (None, None) => true,
+                    _ => false,
+                };
+            if !after_matches && !(staged && now.is_none()) {
+                return Err(err("Content, inode identity or permissions changed after apply; rollback would discard new work."));
             }
-            if let Some(h) = &o.before {
-                self.object(h)?;
+            if let Some(hash) = &o.before {
+                self.object(hash)?;
+                self.retained_original(
+                    &p,
+                    &reference,
+                    &o.path,
+                    &o.side,
+                    hash,
+                    o.permissions_before
+                        .as_ref()
+                        .ok_or_else(|| err("Original supported permissions missing."))?,
+                )?;
             }
-            ops.push(Operation {
-                path: o.path.clone(),
-                side: o.side.clone(),
-                kind: kind(&now, &o.before).into(),
-                before: now,
-                after: o.before.clone(),
-            });
+            ops.push(operation(
+                o.path.clone(),
+                kind(&now, &o.before),
+                &o.side,
+                now,
+                o.before.clone(),
+                o.permissions_before.clone(),
+                if o.before.is_some() {
+                    Some(reference)
+                } else {
+                    None
+                },
+            ));
         }
         self.new_plan(&p, ops, s, t, revision, Some(id.into()), vec![])
     }
+    #[cfg(test)]
     fn write_operation(&self, p: &Pair, o: &Operation, id: &str, index: usize) -> Result<()> {
         self.write_operation_with_hook(p, o, id, index, |_| {})
     }
+    #[cfg(test)]
     fn write_operation_with_hook(
         &self,
         p: &Pair,
         o: &Operation,
         id: &str,
         index: usize,
-        mut hook: impl FnMut(&str),
+        hook: impl FnMut(&str),
     ) -> Result<()> {
+        let plan = self.plan(id)?;
+        let scan = scan_from_plan(&plan, &o.side)?;
+        let before = scan.metadata.files.get(&o.path);
+        let mut directories = scan.metadata.directories.clone();
+        self.write_operation_context(p, o, id, index, before, &mut directories, hook)
+            .map(|_| ())
+    }
+    fn write_operation_context(
+        &self,
+        p: &Pair,
+        o: &Operation,
+        id: &str,
+        index: usize,
+        before_metadata: Option<&AccessMetadata>,
+        directories: &mut BTreeMap<String, String>,
+        mut hook: impl FnMut(&str),
+    ) -> Result<Option<AccessMetadata>> {
         safe_path(&o.path)?;
-        let path = Path::new(if o.side == "source" {
+        let root = Path::new(if o.side == "source" {
             &p.source
         } else {
             &p.target
         });
-        root(path)?;
-        let dir = io(Dir::open_ambient_dir(path, ambient_authority()))?;
-        check_parents(path, &o.path)?;
-        if current_hash(&dir, &o.path)? != o.before {
-            return Err(err("File changed after preview."));
+        root_check(root)?;
+        let dir = io(Dir::open_ambient_dir(root, ambient_authority()))?;
+        check_parents(root, &o.path)?;
+        validate_directories(root, directories)?;
+        let before = current_file(&dir, &o.path)?;
+        if before.as_ref().map(|(h, _)| h) != o.before.as_ref()
+            || before.as_ref().map(|(_, m)| m) != before_metadata
+        {
+            return Err(err(
+                "File content, identity or supported permissions changed after preview.",
+            ));
         }
         let incoming = match &o.after {
             Some(h) => Some(self.object(h)?),
             None => None,
         };
-        // Move the actual outgoing inode to an exclusive recovery directory before
-        // replacement. A last-moment edit is preserved even when its hash differs.
-        // New content always uses no-clobber hard-link installation, never rename-overwrite.
+        let restored = if let Some(reference) = &o.restore_from {
+            Some(
+                self.retained_original(
+                    p,
+                    reference,
+                    &o.path,
+                    &o.side,
+                    o.after
+                        .as_deref()
+                        .ok_or_else(|| err("Restore target hash missing."))?,
+                    o.permissions_after
+                        .as_ref()
+                        .ok_or_else(|| err("Restore target permissions missing."))?,
+                )?,
+            )
+        } else {
+            None
+        };
         hook("before_quarantine");
         if o.before.is_some() {
             let stage = format!(".devdrop-recovery-{id}-{index}");
-            io(dir.create_dir(&stage))?;
-            let recovery = io(dir.open_dir(&stage))?;
-            self.event(
-                "quarantining",
-                &p.id,
-                id,
-                json!({"path":o.path,"side":o.side,"recovery_directory":stage,"before":o.before}),
-            )?;
+            let recovery = create_private_directory(&dir, &stage)?;
+            self.event("quarantining",&p.id,id,json!({"path":o.path,"side":o.side,"recovery_directory":stage,"before":o.before,"permissions_before":o.permissions_before}))?;
             io(dir.rename(&o.path, &recovery, "previous"))?;
-            sync_directory(path)?;
-            sync_directory(&path.join(&stage))?;
-            if current_hash(&recovery, "previous")? != o.before {
-                return Err(err("Target changed during commit; new work is preserved in a .devdrop-recovery-* directory under its registered root."));
+            sync_directory(root)?;
+            sync_directory(&root.join(&stage))?;
+            let preserved = current_file(&recovery, "previous")?;
+            if preserved.as_ref().map(|(h, _)| h) != o.before.as_ref()
+                || preserved.as_ref().map(|(_, m)| m) != before_metadata
+            {
+                return Err(err("Target changed during commit; its actual inode is retained in .devdrop-recovery-* for manual preservation."));
             }
         }
         hook("before_install");
+        let mut expected_installed_metadata = None;
         if let Some(bytes) = incoming {
-            if let Some(parent) = Path::new(&o.path).parent() {
-                if !parent.as_os_str().is_empty() {
-                    io(dir.create_dir_all(parent))?;
+            ensure_private_parents(root, &dir, &o.path, directories)?;
+            if let Some((relative, expected)) = restored {
+                if current_file(&dir, &relative)?.as_ref().map(|(_, m)| m) != Some(&expected) {
+                    return Err(err(
+                        "Retained original identity or permissions changed before restore.",
+                    ));
                 }
+                expected_installed_metadata = Some(expected);
+                // Relink, never chmod or rewrite, the exact original inode. This
+                // restores its existing metadata without touching unrelated links.
+                io(dir.hard_link(&relative, &dir, &o.path))?;
+            } else {
+                let stage = format!(".devdrop-incoming-{id}-{index}");
+                let incoming_dir = create_private_directory(&dir, &stage)?;
+                let mut options = cap_std::fs::OpenOptions::new();
+                options.read(true).write(true).create_new(true);
+                #[cfg(unix)]
+                {
+                    use cap_std::fs::OpenOptionsExt;
+                    options.mode(0o600);
+                }
+                let mut file = io(incoming_dir.open_with("file", &options))?;
+                access::make_private(&io(file.try_clone())?.into_std()).map_err(err)?;
+                io(file.write_all(&bytes))?;
+                io(file.sync_all())?;
+                let permissions = o
+                    .permissions_after
+                    .as_ref()
+                    .ok_or_else(|| err("Intended supported permissions are missing."))?;
+                access::apply_permissions(&io(file.try_clone())?.into_std(), permissions)
+                    .map_err(err)?;
+                io(file.sync_all())?;
+                let prepared = current_file(&incoming_dir, "file")?
+                    .ok_or_else(|| err("Incoming inode disappeared."))?;
+                if Some(&prepared.0) != o.after.as_ref() || &prepared.1.permissions != permissions {
+                    return Err(err(
+                        "Prepared content or supported permissions did not verify.",
+                    ));
+                }
+                sync_directory(&root.join(&stage))?;
+                expected_installed_metadata = Some(prepared.1.clone());
+                self.event("incoming_prepared",&p.id,id,json!({"index":index,"path":o.path,"side":o.side,"metadata":prepared.1,"after":o.after}))?;
+                // Keep this private evidence inode for interruption recovery,
+                // including Windows read-only files that cannot be unlinked safely.
+                io(incoming_dir.hard_link("file", &dir, &o.path))?;
             }
-            check_parents(path, &o.path)?;
-            let parent = Path::new(&o.path).parent().unwrap_or_else(|| Path::new(""));
-            let temporary = parent.join(format!(".devdrop-tmp-{id}-{index}"));
-            let mut opts = cap_std::fs::OpenOptions::new();
-            opts.write(true).create_new(true);
-            let mut f = io(dir.open_with(&temporary, &opts))?;
-            io(f.write_all(&bytes))?;
-            io(f.sync_all())?;
-            drop(f);
-            // A concurrently-created destination is preserved and blocks the operation.
-            io(dir.hard_link(&temporary, &dir, &o.path))?;
-            io(dir.remove_file(&temporary))?;
         }
-        if current_hash(&dir, &o.path)? != o.after {
-            return Err(err("Written content did not verify."));
+        let after = current_file(&dir, &o.path)?;
+        if after.as_ref().map(|(h, _)| h) != o.after.as_ref()
+            || after.as_ref().map(|(_, m)| &m.permissions) != o.permissions_after.as_ref()
+            || after.as_ref().map(|(_, m)| m) != expected_installed_metadata.as_ref()
+        {
+            return Err(err(
+                "Installed content or supported permissions did not verify.",
+            ));
         }
-        // Directory fsync makes rename/unlink durable on Unix, in addition to SQLite FULL commits.
         #[cfg(unix)]
         {
             let parent = Path::new(&o.path).parent().unwrap_or_else(|| Path::new(""));
-            let f = io(File::open(path.join(parent)))?;
-            io(f.sync_all())?;
+            io(File::open(root.join(parent)).and_then(|f| f.sync_all()))?;
         }
-        Ok(())
+        Ok(after.map(|(_, m)| m))
     }
     fn object(&self, h: &str) -> Result<Vec<u8>> {
         if h.len() != 64
@@ -820,7 +1234,10 @@ impl Engine {
         }
         let path = self.state.join("objects").join(h);
         reject_symlinks(&path)?;
-        let bytes = io(fs::read(path))?;
+        let mut file = io(File::open(path))?;
+        access::inspect_file(&file).map_err(err)?;
+        let mut bytes = vec![];
+        io(file.read_to_end(&mut bytes))?;
         if hash(&bytes) != h {
             return Err(err(
                 "Object hash mismatch; preserve state and restore from an intact copy.",
@@ -832,8 +1249,16 @@ impl Engine {
         let h = hash(bytes);
         let path = self.state.join("objects").join(&h);
         reject_symlinks(&path)?;
-        match OpenOptions::new().create_new(true).write(true).open(&path) {
+        let mut options = OpenOptions::new();
+        options.create_new(true).read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&path) {
             Ok(mut f) => {
+                access::make_private(&f).map_err(err)?;
                 io(f.write_all(bytes))?;
                 io(f.sync_all())?;
             }
@@ -846,10 +1271,15 @@ impl Engine {
         }
         Ok(h)
     }
-    fn scan(&self, path: &Path) -> Result<Snapshot> {
+    fn scan(&self, path: &Path) -> Result<ScanData> {
         let path = root(path)?;
         let dir = io(Dir::open_ambient_dir(&path, ambient_authority()))?;
         let mut map = Snapshot::new();
+        let mut metadata = MetadataSnapshot::default();
+        metadata.directories.insert(
+            String::new(),
+            access::inspect_directory(&directory_file(&dir)?).map_err(err)?,
+        );
         let mut casefold = BTreeSet::new();
         let mut total = 0u64;
         // Parse only validated, bounded local .gitignore files. The walker never
@@ -924,6 +1354,11 @@ impl Engine {
                 ));
             }
             if m.is_dir() {
+                metadata.directories.insert(
+                    path_str,
+                    access::inspect_directory(&directory_file(&io(dir.open_dir(relative))?)?)
+                        .map_err(err)?,
+                );
                 continue;
             }
             if !m.is_file() {
@@ -937,11 +1372,6 @@ impl Engine {
                     "Scan budget exceeded; narrow the registered directories.",
                 ));
             }
-            if m.permissions().readonly() {
-                return Err(err(
-                    "Read-only files require a separate writable sync directory.",
-                ));
-            }
             if !casefold.insert(path_str.to_lowercase()) {
                 return Err(err(
                     "Case-colliding paths are blocked for cross-platform safety.",
@@ -949,6 +1379,8 @@ impl Engine {
             }
             check_parents(&path, &path_str)?;
             let mut f = io(dir.open(&path_str))?;
+            let file_metadata =
+                access::inspect_file(&io(f.try_clone())?.into_std()).map_err(err)?;
             let mut bytes = vec![];
             io(std::io::Read::by_ref(&mut f)
                 .take(64 * 1024 * 1024 + 1)
@@ -959,13 +1391,20 @@ impl Engine {
             if secret_content(&bytes) {
                 return Err(err("Potential secret content detected; exclude it before previewing. No content was stored for this file."));
             }
+            if access::inspect_file(&io(f.try_clone())?.into_std()).map_err(err)? != file_metadata {
+                return Err(err("File permissions changed during scan; preview again."));
+            }
             total += bytes.len() as u64;
+            metadata.files.insert(path_str.clone(), file_metadata);
             map.insert(path_str, self.store(&bytes)?);
         }
         if let Some(error) = scan_error.lock().unwrap().take() {
             return Err(error);
         }
-        Ok(map)
+        Ok(ScanData {
+            hashes: map,
+            metadata,
+        })
     }
 }
 fn union(a: &Snapshot, b: &Snapshot, c: &Snapshot) -> BTreeSet<String> {
@@ -1146,18 +1585,146 @@ fn check_parents(root: &Path, path: &str) -> Result<()> {
     safe_path(path)?;
     reject_symlinks(&root.join(path))
 }
-fn current_hash(dir: &Dir, path: &str) -> Result<Option<String>> {
+fn root_check(path: &Path) -> Result<()> {
+    root(path).map(|_| ())
+}
+fn operation(
+    path: String,
+    kind: &str,
+    side: &str,
+    before: Option<String>,
+    after: Option<String>,
+    permissions_after: Option<FilePermissions>,
+    restore_from: Option<RetainedFile>,
+) -> Operation {
+    Operation {
+        path,
+        kind: kind.into(),
+        side: side.into(),
+        before,
+        after,
+        permissions_before: None,
+        permissions_after,
+        permission_widening: false,
+        private_parent_directories: vec![],
+        restore_from,
+    }
+}
+fn scan_from_plan(plan: &Plan, side: &str) -> Result<ScanData> {
+    if plan.metadata_version != 1 {
+        return Err(err("Legacy byte-only plans have no trustworthy permission snapshot. Preserve retained files and create a new preview."));
+    }
+    let (hashes, metadata) = if side == "source" {
+        (&plan.source_scan, &plan.source_metadata)
+    } else {
+        (&plan.target_scan, &plan.target_metadata)
+    };
+    Ok(ScanData {
+        hashes: hashes.clone(),
+        metadata: metadata.clone().ok_or_else(|| {
+            err("Permission snapshot is missing; preserve state and preview again.")
+        })?,
+    })
+}
+fn parent_paths(path: &str) -> Vec<String> {
+    let parts: Vec<_> = path.split('/').collect();
+    (1..parts.len()).map(|i| parts[..i].join("/")).collect()
+}
+fn directory_file(dir: &Dir) -> Result<File> {
+    #[cfg(unix)]
+    {
+        Ok(io(dir.open("."))?.into_std())
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(io(dir.try_clone())?.into_std_file())
+    }
+}
+fn create_private_directory(dir: &Dir, path: &str) -> Result<Dir> {
+    let mut builder = cap_std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use cap_std::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    io(dir.create_dir_with(path, &builder))?;
+    let opened = io(dir.open_dir(path))?;
+    access::make_directory_private(&directory_file(&opened)?).map_err(err)?;
+    Ok(opened)
+}
+fn directory_guard(dir: &Dir, path: &str) -> Result<String> {
+    let opened = if path.is_empty() {
+        io(dir.try_clone())?
+    } else {
+        io(dir.open_dir(path))?
+    };
+    access::inspect_directory(&directory_file(&opened)?).map_err(err)
+}
+fn validate_directories(root: &Path, known: &BTreeMap<String, String>) -> Result<()> {
+    reject_symlinks(root)?;
+    let dir = io(Dir::open_ambient_dir(root, ambient_authority()))?;
+    for (path, guard) in known {
+        if !path.is_empty() {
+            safe_path(path)?;
+            reject_symlinks(&root.join(path))?;
+        }
+        if &directory_guard(&dir, path)? != guard {
+            return Err(err(
+                "Directory identity or access permissions changed; preview again before applying.",
+            ));
+        }
+    }
+    Ok(())
+}
+fn ensure_private_parents(
+    root: &Path,
+    dir: &Dir,
+    path: &str,
+    known: &mut BTreeMap<String, String>,
+) -> Result<()> {
+    validate_directories(root, known)?;
+    for parent in parent_paths(path) {
+        reject_symlinks(&root.join(&parent))?;
+        if let Some(expected) = known.get(&parent) {
+            if &directory_guard(dir, &parent)? != expected {
+                return Err(err("Parent directory permissions changed."));
+            }
+        } else {
+            // An unplanned directory created by another process is never adopted.
+            let created = create_private_directory(dir, &parent)?;
+            known.insert(parent, directory_guard(&created, "")?);
+            sync_directory(root)?;
+        }
+    }
+    Ok(())
+}
+fn current_file(dir: &Dir, path: &str) -> Result<Option<(String, AccessMetadata)>> {
     match dir.symlink_metadata(path) {
         Ok(m) => {
             if !m.is_file() || m.file_type().is_symlink() {
-                return Err(err("Target is not a regular file."));
+                return Err(err("Target is not a regular non-symlink file."));
             }
-            let bytes = io(dir.read(path))?;
-            Ok(Some(hash(&bytes)))
+            let mut file = io(dir.open(path))?;
+            let metadata = access::inspect_file(&io(file.try_clone())?.into_std()).map_err(err)?;
+            let mut bytes = vec![];
+            io(std::io::Read::by_ref(&mut file)
+                .take(64 * 1024 * 1024 + 1)
+                .read_to_end(&mut bytes))?;
+            if bytes.len() > 64 * 1024 * 1024 {
+                return Err(err("File exceeds verification budget."));
+            }
+            if access::inspect_file(&io(file.try_clone())?.into_std()).map_err(err)? != metadata {
+                return Err(err("File metadata changed during verification."));
+            }
+            Ok(Some((hash(&bytes), metadata)))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(_) => Err(err("Cannot verify target file.")),
+        Err(_) => Err(err("Cannot verify target content and permissions.")),
     }
+}
+#[cfg(test)]
+fn current_hash(dir: &Dir, path: &str) -> Result<Option<String>> {
+    Ok(current_file(dir, path)?.map(|(hash, _)| hash))
 }
 fn secret_content(bytes: &[u8]) -> bool {
     let s = String::from_utf8_lossy(bytes);
@@ -1334,14 +1901,18 @@ pub fn dispatch(state_dir: &Path, request: Value) -> Result<Value> {
             json!(engine.apply(
                 text(&request, "plan_id")?,
                 text(&request, "approval")?,
-                request.get("disposable_copies").and_then(Value::as_bool) == Some(true)
+                request.get("disposable_copies").and_then(Value::as_bool) == Some(true),
+                request
+                    .get("allow_permission_widening")
+                    .and_then(Value::as_bool)
+                    == Some(true)
             )?)
         }
         "rollback_preview" => json!(engine.rollback_preview(text(&request, "plan_id")?)?),
         "events" => engine.events()?,
         "handoff" => {
             let pair_id = text(&request, "pair_id")?;
-            let (p, _, revision) = engine.pair(pair_id)?;
+            let (p, _, _, revision) = engine.pair(pair_id)?;
             let (s, t) = engine.scans(&p)?;
             let pending=engine.plans()?.into_iter().filter(|p|p.pair_id==pair_id && matches!(p.state.as_str(),"planned"|"recovery_required")).map(|p|json!({"plan_id":p.id,"state":p.state,"conflicts":p.operations.iter().filter(|o|o.kind=="conflict").count(),"blockers":p.blockers})).collect::<Vec<_>>();
             json!({"pair_id":p.id,"revision":revision,"source_files":s.len(),"target_files":t.len(),"workspace_creation_allowed":false,"pending":pending,"forbidden":["secrets","generated files","Git mutations","filesystem apply via MCP"],"redaction_notice":"No root paths, project names, raw file contents, task text, or env values are included. Approval is required in the local app or CLI."})
@@ -1363,6 +1934,9 @@ mod tests {
     impl Workspace {
         fn new() -> Self {
             let temp = tempfile::tempdir().unwrap();
+            #[cfg(windows)]
+            access::make_disposable_test_directory_private(&fs::canonicalize(temp.path()).unwrap())
+                .unwrap();
             let source = fs::canonicalize(temp.path()).unwrap().join("source");
             let target = fs::canonicalize(temp.path()).unwrap().join("target");
             let state = fs::canonicalize(temp.path()).unwrap().join("state");
@@ -1403,15 +1977,15 @@ mod tests {
         assert_eq!(plan.operations.len(), 1);
         assert_eq!(plan.operations[0].kind, "copy");
         assert!(!w.target.join("src/main.rs").exists());
-        assert!(e.apply(&plan.id, "yes", true).is_err());
+        assert!(e.apply(&plan.id, "yes", true, true).is_err());
         drop(e);
         let e = w.engine();
         assert_eq!(e.pairs().unwrap()[0].id, p.id);
-        let receipt = e.apply(&plan.id, &plan.id, true).unwrap();
+        let receipt = e.apply(&plan.id, &plan.id, true, true).unwrap();
         assert_eq!(receipt.state, "verified");
         assert_eq!(fs::read(w.target.join("src/main.rs")).unwrap(), b"first");
         assert!(e
-            .apply(&plan.id, &plan.id, true)
+            .apply(&plan.id, &plan.id, true, true)
             .unwrap()
             .changed
             .is_empty());
@@ -1426,19 +2000,19 @@ mod tests {
         let first = e.preview(&p.id).unwrap();
         w.source("a", b"new source");
         assert!(e
-            .apply(&first.id, &first.id, true)
+            .apply(&first.id, &first.id, true, true)
             .unwrap_err()
             .to_string()
             .contains("stale"));
         let second = e.preview(&p.id).unwrap();
         w.target("b", b"independent edit");
-        assert!(e.apply(&second.id, &second.id, true).is_err());
+        assert!(e.apply(&second.id, &second.id, true, true).is_err());
         assert!(!w.target.join("a").exists());
         fs::remove_file(w.target.join("b")).unwrap();
         let a = e.preview(&p.id).unwrap();
         let b = e.preview(&p.id).unwrap();
-        e.apply(&a.id, &a.id, true).unwrap();
-        assert!(e.apply(&b.id, &b.id, true).is_err());
+        e.apply(&a.id, &a.id, true, true).unwrap();
+        assert!(e.apply(&b.id, &b.id, true, true).is_err());
     }
     #[test]
     fn conflict_preserves_both_and_resolution_is_separately_approved() {
@@ -1449,15 +2023,15 @@ mod tests {
         let p = w.register(&e);
         let plan = e.preview(&p.id).unwrap();
         assert_eq!(plan.operations[0].kind, "conflict");
-        assert!(e.apply(&plan.id, &plan.id, true).is_err());
+        assert!(e.apply(&plan.id, &plan.id, true, true).is_err());
         assert_eq!(fs::read(w.target.join("a")).unwrap(), b"target");
         for bytes in [b"source".as_slice(), b"target".as_slice()] {
             assert_eq!(e.object(&hash(bytes)).unwrap(), bytes);
         }
         let resolution = e.resolve_preview(&p.id, "a", "both").unwrap();
         assert_eq!(resolution.operations.len(), 3);
-        assert!(e.apply(&resolution.id, &plan.id, true).is_err());
-        e.apply(&resolution.id, &resolution.id, true).unwrap();
+        assert!(e.apply(&resolution.id, &plan.id, true, true).is_err());
+        e.apply(&resolution.id, &resolution.id, true, true).unwrap();
         let sibling = format!("a.devdrop-conflict-{}", &hash(b"target")[..12]);
         assert_eq!(fs::read(w.target.join(&sibling)).unwrap(), b"target");
         assert_eq!(fs::read(w.source.join(&sibling)).unwrap(), b"target");
@@ -1473,12 +2047,12 @@ mod tests {
         let p = w.register(&e);
         let resolve = e.resolve_preview(&p.id, "a", "target").unwrap();
         assert_eq!(resolve.operations[0].side, "source");
-        e.apply(&resolve.id, &resolve.id, true).unwrap();
+        e.apply(&resolve.id, &resolve.id, true, true).unwrap();
         assert_eq!(fs::read(w.source.join("a")).unwrap(), b"target");
         fs::remove_file(w.target.join("a")).unwrap();
         let conflict = e.preview(&p.id).unwrap();
         assert_eq!(conflict.operations[0].kind, "conflict");
-        assert!(e.apply(&conflict.id, &conflict.id, true).is_err());
+        assert!(e.apply(&conflict.id, &conflict.id, true, true).is_err());
     }
     #[test]
     fn approved_replace_delete_tombstone_restore_and_dirty_guard() {
@@ -1487,27 +2061,27 @@ mod tests {
         let e = w.engine();
         let p = w.register(&e);
         let initial = e.preview(&p.id).unwrap();
-        e.apply(&initial.id, &initial.id, true).unwrap();
+        e.apply(&initial.id, &initial.id, true, true).unwrap();
         w.source("a", b"updated");
         let update = e.preview(&p.id).unwrap();
         assert_eq!(update.operations[0].kind, "replace");
-        e.apply(&update.id, &update.id, true).unwrap();
+        e.apply(&update.id, &update.id, true, true).unwrap();
         let undo = e.rollback_preview(&update.id).unwrap();
         w.target("a", b"new local work");
-        assert!(e.apply(&undo.id, &undo.id, true).is_err());
+        assert!(e.apply(&undo.id, &undo.id, true, true).is_err());
         assert!(e.rollback_preview(&update.id).is_err());
         w.target("a", b"updated");
         let undo = e.rollback_preview(&update.id).unwrap();
-        e.apply(&undo.id, &undo.id, true).unwrap();
+        e.apply(&undo.id, &undo.id, true, true).unwrap();
         assert_eq!(fs::read(w.target.join("a")).unwrap(), b"original");
         // Source differs again after rollback; resolve intentionally, then delete from the shared baseline.
         let resolution = e.resolve_preview(&p.id, "a", "source").unwrap();
-        e.apply(&resolution.id, &resolution.id, true).unwrap();
+        e.apply(&resolution.id, &resolution.id, true, true).unwrap();
         fs::remove_file(w.source.join("a")).unwrap();
         let deletion = e.preview(&p.id).unwrap();
         assert_eq!(deletion.operations[0].kind, "delete");
         assert!(w.target.join("a").exists());
-        e.apply(&deletion.id, &deletion.id, true).unwrap();
+        e.apply(&deletion.id, &deletion.id, true, true).unwrap();
         assert!(!w.target.join("a").exists());
         assert!(e
             .events()
@@ -1517,7 +2091,7 @@ mod tests {
             .iter()
             .any(|v| v["kind"] == "tombstone"));
         let restore = e.rollback_preview(&deletion.id).unwrap();
-        e.apply(&restore.id, &restore.id, true).unwrap();
+        e.apply(&restore.id, &restore.id, true, true).unwrap();
         assert_eq!(fs::read(w.target.join("a")).unwrap(), b"updated");
     }
     #[test]
@@ -1535,10 +2109,10 @@ mod tests {
         let e = w.engine();
         assert_eq!(e.plan(&plan.id).unwrap().state, "recovery_required");
         assert!(e.preview(&p.id).is_err());
-        assert!(e.apply(&plan.id, &plan.id, true).is_err());
+        assert!(e.apply(&plan.id, &plan.id, true, true).is_err());
         let rollback = e.rollback_preview(&plan.id).unwrap();
         assert_eq!(rollback.operations.len(), 1);
-        e.apply(&rollback.id, &rollback.id, true).unwrap();
+        e.apply(&rollback.id, &rollback.id, true, true).unwrap();
         assert!(!w.target.join("a").exists());
         assert_eq!(fs::read(w.source.join("a")).unwrap(), b"alpha");
         assert_eq!(e.plan(&plan.id).unwrap().state, "rolled_back");
@@ -1559,7 +2133,7 @@ mod tests {
         let e = w.engine();
         let rollback = e.rollback_preview(&plan.id).unwrap();
         assert_eq!(rollback.operations.len(), 1);
-        e.apply(&rollback.id, &rollback.id, true).unwrap();
+        e.apply(&rollback.id, &rollback.id, true, true).unwrap();
         assert!(!w.target.join("a").exists());
     }
     #[test]
@@ -1571,7 +2145,7 @@ mod tests {
         let p = w.register(&e);
         let plan = e.preview(&p.id).unwrap();
         fs::write(w.state.join("objects").join(hash(b"alpha")), b"corrupt").unwrap();
-        assert!(e.apply(&plan.id, &plan.id, true).is_err());
+        assert!(e.apply(&plan.id, &plan.id, true, true).is_err());
         assert!(!w.target.join("a").exists());
     }
     #[test]
@@ -1598,7 +2172,7 @@ mod tests {
             .join(hash(canary.as_bytes()))
             .exists());
         assert_eq!(plan.operations.len(), 2);
-        e.apply(&plan.id, &plan.id, true).unwrap();
+        e.apply(&plan.id, &plan.id, true, true).unwrap();
         assert!(!w.target.join(".env").exists());
         assert!(!w.target.join("ignored.txt").exists());
     }
@@ -1666,7 +2240,7 @@ mod tests {
         let p = w.register(&e);
         let plan = e.preview(&p.id).unwrap();
         symlink(&outside, w.target.join("nested")).unwrap();
-        assert!(e.apply(&plan.id, &plan.id, true).is_err());
+        assert!(e.apply(&plan.id, &plan.id, true, true).is_err());
         assert_eq!(fs::read(outside.join("a")).unwrap(), b"outside");
         fs::remove_file(w.target.join("nested")).unwrap();
         symlink(outside.join("a"), w.source.join("link")).unwrap();
@@ -1679,8 +2253,11 @@ mod tests {
         let p = w.register(&e);
         let plan = e.preview(&p.id).unwrap();
         assert!(plan.operations.is_empty());
-        assert!(e.apply(&plan.id, "", true).is_err());
-        assert_eq!(e.apply(&plan.id, &plan.id, true).unwrap().state, "verified");
+        assert!(e.apply(&plan.id, "", true, true).is_err());
+        assert_eq!(
+            e.apply(&plan.id, &plan.id, true, true).unwrap().state,
+            "verified"
+        );
         assert!(e
             .events()
             .unwrap()
@@ -1696,7 +2273,7 @@ mod tests {
         let e = w.engine();
         let p = w.register(&e);
         let initial = e.preview(&p.id).unwrap();
-        e.apply(&initial.id, &initial.id, true).unwrap();
+        e.apply(&initial.id, &initial.id, true, true).unwrap();
         w.source("a", b"incoming");
         let mut plan = e.preview(&p.id).unwrap();
         plan.state = "applying".into();
@@ -1721,7 +2298,7 @@ mod tests {
         let e = w.engine();
         let p = w.register(&e);
         let initial = e.preview(&p.id).unwrap();
-        e.apply(&initial.id, &initial.id, true).unwrap();
+        e.apply(&initial.id, &initial.id, true, true).unwrap();
         w.source("a", b"incoming");
         let plan = e.preview(&p.id).unwrap();
         let result = e.write_operation_with_hook(&p, &plan.operations[0], &plan.id, 0, |stage| {
@@ -1750,7 +2327,7 @@ mod tests {
         let e = w.engine();
         let p = w.register(&e);
         let initial = e.preview(&p.id).unwrap();
-        e.apply(&initial.id, &initial.id, true).unwrap();
+        e.apply(&initial.id, &initial.id, true, true).unwrap();
         w.source("a", b"new");
         let mut plan = e.preview(&p.id).unwrap();
         plan.state = "applying".into();
@@ -1762,7 +2339,7 @@ mod tests {
         let e = w.engine();
         let rollback = e.rollback_preview(&plan.id).unwrap();
         assert_eq!(rollback.operations[0].kind, "copy");
-        e.apply(&rollback.id, &rollback.id, true).unwrap();
+        e.apply(&rollback.id, &rollback.id, true, true).unwrap();
         assert_eq!(fs::read(w.target.join("a")).unwrap(), b"old");
     }
     #[test]
@@ -1808,7 +2385,9 @@ mod tests {
         let plan = e.preview(&p.id).unwrap();
         assert_eq!(plan.beta_warning, BETA_WARNING);
         assert_eq!(
-            e.apply(&plan.id, &plan.id, false).unwrap_err().to_string(),
+            e.apply(&plan.id, &plan.id, false, true)
+                .unwrap_err()
+                .to_string(),
             BETA_WARNING
         );
         assert!(!w.target.join("src/main.rs").exists());
@@ -1833,7 +2412,7 @@ mod tests {
         }
         let result = dispatch(
             &w.state,
-            json!({"action":"apply","plan_id":plan.id,"approval":plan.id,"disposable_copies":true}),
+            json!({"action":"apply","plan_id":plan.id,"approval":plan.id,"disposable_copies":true,"allow_permission_widening":true}),
         )
         .unwrap();
         assert_eq!(result["state"], "verified");
@@ -1857,8 +2436,92 @@ mod tests {
             BETA_WARNING
         );
         assert!(w.target.join("src/main.rs").exists());
-        let result=dispatch(&w.state,json!({"action":"rollback","plan_id":rollback.id,"approval":rollback.id,"disposable_copies":true})).unwrap();
+        let result=dispatch(&w.state,json!({"action":"rollback","plan_id":rollback.id,"approval":rollback.id,"disposable_copies":true,"allow_permission_widening":true})).unwrap();
         assert_eq!(result["state"], "rolled_back");
         assert!(!w.target.join("src/main.rs").exists());
+    }
+    #[test]
+    fn schema_one_registry_migrates_without_trusting_legacy_permission_plans() {
+        let w = Workspace::new();
+        fs::create_dir(&w.state).unwrap();
+        let db = Connection::open(w.state.join("metadata.sqlite3")).unwrap();
+        db.execute_batch("CREATE TABLE schema_version(version INTEGER NOT NULL); INSERT INTO schema_version VALUES(1); CREATE TABLE pairs(id TEXT PRIMARY KEY,body TEXT NOT NULL,baseline TEXT NOT NULL,revision INTEGER NOT NULL DEFAULT 0);").unwrap();
+        drop(db);
+        let e = w.engine();
+        let version: i64 =
+            e.db.query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+                .unwrap();
+        assert_eq!(version, 2);
+        let p = w.register(&e);
+        let baseline: String =
+            e.db.query_row(
+                "SELECT baseline_permissions FROM pairs WHERE id=?1",
+                [&p.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(baseline, "{}");
+        let plan = e.preview(&p.id).unwrap();
+        assert_eq!(plan.metadata_version, 1);
+        assert!(plan.source_metadata.is_some());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn restore_rechecks_retained_inode_identity_at_the_install_boundary() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let w = Workspace::new();
+        w.source("a", b"old");
+        fs::set_permissions(w.source.join("a"), fs::Permissions::from_mode(0o600)).unwrap();
+        let e = w.engine();
+        let p = w.register(&e);
+        let initial = e.preview(&p.id).unwrap();
+        e.apply(&initial.id, &initial.id, true, true).unwrap();
+        w.source("a", b"new");
+        let update = e.preview(&p.id).unwrap();
+        e.apply(&update.id, &update.id, true, true).unwrap();
+        let rollback = e.rollback_preview(&update.id).unwrap();
+        let original = w
+            .target
+            .join(format!(".devdrop-recovery-{}-0/previous", update.id));
+        let saved = w._temp.path().join("retained-original-outside-root");
+        let original_inode = fs::metadata(&original).unwrap().ino();
+        let result =
+            e.write_operation_with_hook(&p, &rollback.operations[0], &rollback.id, 0, |stage| {
+                if stage == "before_install" {
+                    fs::rename(&original, &saved).unwrap();
+                    fs::write(&original, b"old").unwrap();
+                    fs::set_permissions(&original, fs::Permissions::from_mode(0o600)).unwrap();
+                }
+            });
+        assert!(result.is_err());
+        assert_eq!(fs::metadata(saved).unwrap().ino(), original_inode);
+        assert!(!w.target.join("a").exists());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn permission_edit_race_is_preserved_in_the_actual_outgoing_inode() {
+        use std::os::unix::fs::PermissionsExt;
+        let w = Workspace::new();
+        w.source("a", b"old");
+        fs::set_permissions(w.source.join("a"), fs::Permissions::from_mode(0o600)).unwrap();
+        let e = w.engine();
+        let p = w.register(&e);
+        let first = e.preview(&p.id).unwrap();
+        e.apply(&first.id, &first.id, true, true).unwrap();
+        w.source("a", b"new");
+        let plan = e.preview(&p.id).unwrap();
+        let result = e.write_operation_with_hook(&p, &plan.operations[0], &plan.id, 0, |stage| {
+            if stage == "before_quarantine" {
+                fs::set_permissions(w.target.join("a"), fs::Permissions::from_mode(0o400)).unwrap();
+            }
+        });
+        assert!(result.is_err());
+        let retained = w
+            .target
+            .join(format!(".devdrop-recovery-{}-0/previous", plan.id));
+        assert_eq!(
+            fs::metadata(retained).unwrap().permissions().mode() & 0o777,
+            0o400
+        );
     }
 }

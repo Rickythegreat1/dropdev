@@ -8,13 +8,25 @@ through a public reverse proxy or add unauthenticated write endpoints.
 
 ## Beta release boundary
 
-The native app and CLI are for disposable project copies only. Never register or
-sync primary working trees. Replacement and rollback do not preserve permissions,
-executable bits or other file metadata. Apply and rollback require exact-plan
-approval plus `--disposable-copies` in the CLI or the explicit native checkbox;
-the Rust runtime rejects missing, false and non-boolean confirmations.
-Acknowledgement is an intent gate, not sandbox proof. Installer compilation does
-not validate primary-worktree use or restore permissions.
+Use disposable project copies only; never primary working trees. Permission-aware
+plans copy source Unix rwx/Windows read-only flags and restore the retained
+original destination inode on rollback. File/dir identity and access metadata are
+part of stale-plan validation. New groups/others grants or any added existing
+Unix permission, and Windows read-only-to-writable transitions, require separate
+`--allow-permission-widening`/native approval alongside exact-plan and disposable
+confirmation. The intent gate does not prove sandboxed directories.
+
+Full ACL, ownership, xattr, audit-policy and timestamp replication is unsupported.
+Only the constrained [file access policy](file-permissions.md) is accepted.
+Windows requires canonical current-user/SYSTEM/Administrators private DACLs,
+current ownership/group and default-medium integrity; production does not rewrite
+a directory's ACL to make it pass. Unix rejects extended ACLs/xattrs and special
+bits. Never silently strip metadata to bypass these refusals.
+
+Schema 1 metadata upgrades transactionally to schema 2; old byte-only plans refuse
+apply/rollback. Retain old state and evidence and create fresh permission-aware
+previews. Fresh copies/state are needed if a legacy interrupted operation blocks
+new previews. Prior byte-only installers are superseded.
 
 ## Build and verification
 
@@ -182,6 +194,6 @@ proves both rows roll back, including after reopening state.
 
 The same correction adds a runtime disposable-copy confirmation gate, a warning
 on every plan, explicit CLI/native acknowledgement and persistent UI guidance.
-File-mode/permission preservation remains unimplemented; this release is not for
-primary working trees. Use the newest handoff/CI artifact, not the prior
-ungated `4852013` build.
+That historical byte-only limitation is superseded by metadata-version-one
+permission plans described above. Full metadata replication is still unsupported,
+and primary working trees remain prohibited. Use the newest handoff/CI artifacts.

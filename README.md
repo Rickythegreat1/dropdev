@@ -8,13 +8,17 @@ native control surface. No Docker is required.
 ## Disposable-copy beta only
 
 Do not register or sync primary working trees. Use disposable project copies
-only. Replacement and rollback restore file bytes, but do not preserve file
-permissions, executable bits, ownership, ACLs, or other file metadata.
+only. New permission-aware plans preserve Unix `rwx` bits (including executable
+flags) and Windows read-only flags within the [supported access policy](docs/file-permissions.md).
+Full ownership, ACL, audit-policy, timestamp and extended-metadata replication is
+unsupported; custom access policies and metadata outside the policy are blocked.
 
-Every apply and rollback requires both the exact plan approval and an explicit
-disposable-copy acknowledgement: the native approval checkbox or the CLI
-`--disposable-copies` flag. Plans also carry this beta warning. This confirms
-caller intent; it does not prove the directories are copies or sandbox them.
+Every apply and rollback requires exact-plan approval and an explicit
+disposable-copy acknowledgement: the native checkbox or CLI `--disposable-copies`.
+Any access increase additionally requires the unchecked native permission approval
+or CLI `--allow-permission-widening`. This includes new Unix group/other grants,
+added `rwx` bits and Windows read-only-to-writable changes, including rollback.
+These confirmations declare intent; they do not verify or sandbox the copies.
 
 ## Implemented local workflow
 
@@ -43,8 +47,9 @@ cargo build --workspace --locked
 ./target/debug/devdrop local --state-dir /tmp/devdrop-state list
 ./target/debug/devdrop local --state-dir /tmp/devdrop-state preview PAIR_ID
 ./target/debug/devdrop local --state-dir /tmp/devdrop-state apply PLAN_ID --approve PLAN_ID --disposable-copies
+# Only after reviewing every listed access increase, add --allow-permission-widening.
 ./target/debug/devdrop local --state-dir /tmp/devdrop-state rollback-preview PLAN_ID
-# Review the rollback plan, then apply its ID with --approve and --disposable-copies.
+# Review rollback permissions, then approve its ID and any listed access increase.
 ```
 
 Create both project directories before registration and keep the state directory
@@ -94,21 +99,31 @@ not universal secret detection: review the files you choose to register.
 
 Each replace/delete first preserves the actual outgoing file at
 `.devdrop-recovery-<plan-id>-<operation-index>/previous` under its affected root.
-These directories are excluded from sync and retained. If an editor races an
+These directories are excluded from sync and retained. Incoming inodes are also
+retained privately in `.devdrop-incoming-*` to prove their identity after an
+interruption. New Unix staging files/directories start at `0600`/`0700` before
+bytes are written; new project parent directories use private permissions. If an editor races an
 operation, DevDrop preserves its bytes and blocks rather than overwriting them.
+Rollback validates and relinks the exact original inode instead of rebuilding
+it from cached bytes, restoring its original destination metadata. A missing,
+replaced or changed original blocks automatic rollback. Old byte-only plans
+cannot apply or roll back; preserve old state/backups and create new permission-aware
+previews (use fresh disposable copies/state if a legacy interrupted plan blocks progress).
 Use Activity & recovery to locate backups. Preserve newer local edits before
 manual recovery; do not delete the state directory or retained backups during
 recovery. Verified object bytes are also retained in the state directory.
 
-This MVP synchronizes regular-file content. It blocks symlinks and special files;
-it does not synchronize file ownership, executable/permission changes, empty
-directories, remote machines or cloud objects. Environment values are never
+This beta synchronizes regular-file content and supported basic permissions.
+Metadata-only permission changes are explicit preview operations. Ownership/group
+changes, special bits, custom Unix ACLs/xattrs and nonstandard Windows access
+policies are blocked. Windows has no Unix executable-bit mapping. Empty-directory
+replication, remote machines and cloud objects remain unsupported. Environment values are never
 transferred; env/runtime availability and agent workspace execution remain local
 setup responsibilities. Hydration remains the existing bounded sandbox simulation.
 External Git clean/process filters block sync observation rather than executing
 repository-configured code. Git state itself is never mutated. On Windows,
 SQLite uses FULL durability and file flushes; Unix additionally fsyncs directories.
-This release remains a content-only beta for disposable project copies.
+This release remains a permission-aware beta for disposable project copies.
 
 ## Verification and delivery
 

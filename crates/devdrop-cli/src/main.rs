@@ -103,15 +103,21 @@ enum LocalCommand {
     /// Reconcile both roots and persist an exact dry-run plan.
     Preview { pair_id: String },
     /// Beta: apply a reviewed plan only to disposable copies, never primary working trees.
-    /// Replace and rollback preserve bytes but do not preserve permissions or executable bits.
+    /// Unix: preserves basic rwx bits for files owned by the current user and primary group;
+    /// special bits, custom ACLs and extended attributes are blocked. Windows: preserves
+    /// readonly only in current-user private directories with canonical owner/SYSTEM/Admin
+    /// full-control rules; custom ACLs are blocked. Rollback retains original inode metadata.
     Apply {
         plan_id: String,
         /// Must exactly match the reviewed plan ID.
         #[arg(long)]
         approve: String,
-        /// Acknowledge disposable copies only; replace/rollback do not preserve mode bits.
+        /// Acknowledge disposable copies only; never primary working trees.
         #[arg(long)]
         disposable_copies: bool,
+        /// Separately approve planned permission widening, including new access or executable bits.
+        #[arg(long)]
+        allow_permission_widening: bool,
     },
     /// Prepare an undo plan. Review it, then apply its new plan ID.
     RollbackPreview { plan_id: String },
@@ -142,8 +148,9 @@ fn local_request(command: &LocalCommand) -> serde_json::Value {
             plan_id,
             approve,
             disposable_copies,
+            allow_permission_widening,
         } => {
-            json!({"action":"apply", "plan_id":plan_id, "approval":approve,"disposable_copies":disposable_copies})
+            json!({"action":"apply", "plan_id":plan_id, "approval":approve,"disposable_copies":disposable_copies,"allow_permission_widening":allow_permission_widening})
         }
         LocalCommand::RollbackPreview { plan_id } => {
             json!({"action":"rollback_preview", "plan_id":plan_id})

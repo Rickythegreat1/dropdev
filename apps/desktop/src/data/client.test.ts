@@ -89,3 +89,59 @@ test("beta apply and rollback refuse missing or false disposable-copy confirmati
   }
   expect((await preview()).target_scan).toEqual({});
 });
+
+test("permission-only access increase needs separate approval and recovery restores its previous mode", async () => {
+  await apply(await preview());
+  await command({ action: "demo_permissions" });
+  const plan = await preview();
+  expect(plan.operations).toHaveLength(1);
+  expect(plan.operations[0]).toMatchObject({
+    kind: "permissions",
+    permissions_before: { platform: "unix", mode: 0o644 },
+    permissions_after: { platform: "unix", mode: 0o755 },
+    permission_widening: true,
+  });
+  for (const allow_permission_widening of [undefined, false, "true"]) {
+    await expect(
+      command({
+        action: "apply",
+        plan_id: plan.id,
+        approval: plan.id,
+        disposable_copies: true,
+        allow_permission_widening,
+      }),
+    ).rejects.toThrow("separate explicit approval");
+  }
+  expect((await preview()).target_permissions?.["src/notes.ts"]).toEqual({
+    platform: "unix",
+    mode: 0o644,
+  });
+  await command({
+    action: "apply",
+    plan_id: plan.id,
+    approval: plan.id,
+    disposable_copies: true,
+    allow_permission_widening: true,
+  });
+  const recovery = await command<Plan>({
+    action: "rollback_preview",
+    plan_id: plan.id,
+  });
+  expect(recovery.operations[0]).toMatchObject({
+    kind: "permissions",
+    permissions_before: { platform: "unix", mode: 0o755 },
+    permissions_after: { platform: "unix", mode: 0o644 },
+    permission_widening: false,
+  });
+  await apply(recovery);
+  expect((await preview()).target_permissions?.["src/notes.ts"]).toEqual({
+    platform: "unix",
+    mode: 0o644,
+  });
+});
+
+test("permission changes invalidate a previously built content plan", async () => {
+  const plan = await preview();
+  await command({ action: "demo_permissions" });
+  await expect(apply(plan)).rejects.toThrow("Stale plan");
+});

@@ -31,9 +31,12 @@ state and changed directories. Retained backup directories are excluded from syn
 Preview plan rows and their event now commit in the same SQLite transaction;
 fault-injected event failure rolls the plan back as well. Every apply/rollback
 also requires explicit caller confirmation that the roots are disposable copies.
-This gate declares intent and does not establish a sandbox. The byte-only object
-store/restore path does not preserve permissions, executable bits or ACLs; the
-native UI, CLI and plan metadata forbid primary working trees in this beta.
+This gate declares intent and does not establish a sandbox. Permission-aware plans now snapshot content, supported basic flags and inode/security
+guards. Schema 2 adds a permission baseline; legacy plans lacking snapshots refuse
+mutation. Unix rwx/Windows read-only changes are explicit operations and access
+increases need separate approval. Rollback relinks guarded retained original
+inodes. The native UI, CLI and plan metadata still forbid primary working trees;
+full ACL/ownership/xattr replication is unsupported. See `file-permissions.md`.
 
 The following foundation sections retain historical contracts for the observer
 daemon, legacy fixture commands and hydration simulation. Statements that apply

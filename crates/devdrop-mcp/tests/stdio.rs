@@ -5,6 +5,11 @@ use std::process::{Command, Stdio};
 #[test]
 fn binary_streams_only_jsonrpc_and_refuses_mutation_tools() {
     let state = tempfile::tempdir().unwrap();
+    #[cfg(windows)]
+    devdrop_core::file_permissions::make_disposable_test_directory_private(
+        &std::fs::canonicalize(state.path()).unwrap(),
+    )
+    .unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_devdrop-mcp"))
         .arg("--state-dir")
         .arg(std::fs::canonicalize(state.path()).unwrap())

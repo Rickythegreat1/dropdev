@@ -9,6 +9,7 @@ pub mod content_hash;
 pub mod env_profile;
 pub mod error;
 pub mod event_log;
+pub mod file_permissions;
 pub mod hydration;
 pub mod ignore_policy;
 pub mod local;

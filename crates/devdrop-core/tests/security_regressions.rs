@@ -12,6 +12,11 @@ struct Workspace {
 impl Workspace {
     fn new() -> Self {
         let temp = tempfile::tempdir().unwrap();
+        #[cfg(windows)]
+        devdrop_core::file_permissions::make_disposable_test_directory_private(
+            &fs::canonicalize(temp.path()).unwrap(),
+        )
+        .unwrap();
         let source = fs::canonicalize(temp.path()).unwrap().join("source");
         let target = fs::canonicalize(temp.path()).unwrap().join("target");
         let state = fs::canonicalize(temp.path()).unwrap().join("metadata");
@@ -42,11 +47,11 @@ fn newly_ignored_content_is_preserved_instead_of_deleted() {
     let engine = Engine::open(&w.state).unwrap();
     let pair = w.pair(&engine);
     let first = engine.preview(&pair.id).unwrap();
-    engine.apply(&first.id, &first.id, true).unwrap();
+    engine.apply(&first.id, &first.id, true, true).unwrap();
     fs::write(w.source.join(".gitignore"), b"keep.txt\n").unwrap();
     let next = engine.preview(&pair.id).unwrap();
     assert!(next.operations.iter().all(|op| op.path != "keep.txt"));
-    engine.apply(&next.id, &next.id, true).unwrap();
+    engine.apply(&next.id, &next.id, true, true).unwrap();
     assert_eq!(
         fs::read(w.target.join("keep.txt")).unwrap(),
         b"preserve existing workspace content"
@@ -65,11 +70,11 @@ fn ripgrep_ignore_configuration_cannot_create_deletion_intent() {
     let engine = Engine::open(&w.state).unwrap();
     let pair = w.pair(&engine);
     let first = engine.preview(&pair.id).unwrap();
-    engine.apply(&first.id, &first.id, true).unwrap();
+    engine.apply(&first.id, &first.id, true, true).unwrap();
     fs::write(w.source.join(".ignore"), b"keep.txt\n").unwrap();
     let next = engine.preview(&pair.id).unwrap();
     assert!(next.operations.iter().all(|op| op.kind != "delete"));
-    engine.apply(&next.id, &next.id, true).unwrap();
+    engine.apply(&next.id, &next.id, true, true).unwrap();
     assert_eq!(
         fs::read(w.target.join("keep.txt")).unwrap(),
         b"preserve existing workspace content"
@@ -154,7 +159,7 @@ fn dirty_git_is_detected_when_registered_root_is_inside_worktree() {
                 !plan.blockers.is_empty(),
                 "nested root silently bypassed dirty Git gate"
             );
-            assert!(engine.apply(&plan.id, &plan.id, true).is_err());
+            assert!(engine.apply(&plan.id, &plan.id, true, true).is_err());
         }
         Err(error) => {
             // Standard hosted runners configure Git LFS globally. A refusal to
@@ -263,7 +268,7 @@ fn nested_anchored_gitignore_is_scoped_to_its_own_directory() {
     for object in fs::read_dir(w.state.join("objects")).unwrap() {
         assert_ne!(fs::read(object.unwrap().path()).unwrap(), canary);
     }
-    engine.apply(&plan.id, &plan.id, true).unwrap();
+    engine.apply(&plan.id, &plan.id, true, true).unwrap();
     assert!(!w.target.join("nested/private.txt").exists());
 }
 
@@ -294,7 +299,7 @@ fn nested_gitignore_can_reinclude_a_file_inside_an_unignored_parent() {
         .operations
         .iter()
         .all(|op| op.path != "nested/private.txt"));
-    engine.apply(&plan.id, &plan.id, true).unwrap();
+    engine.apply(&plan.id, &plan.id, true, true).unwrap();
     assert!(w.target.join("nested/public.txt").exists());
     assert!(!w.target.join("nested/private.txt").exists());
 }

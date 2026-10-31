@@ -23,15 +23,34 @@ fn successful(state: &Path, args: &[&str]) -> Value {
     serde_json::from_slice(&output.stdout).expect("JSON response")
 }
 
+fn disposable_tempdir() -> tempfile::TempDir {
+    let temp = tempfile::tempdir().unwrap();
+    #[cfg(windows)]
+    devdrop_core::file_permissions::make_disposable_test_directory_private(
+        &fs::canonicalize(temp.path()).unwrap(),
+    )
+    .unwrap();
+    temp
+}
+
+fn write_fixture(path: &Path, bytes: &[u8]) {
+    fs::write(path, bytes).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o644)).unwrap();
+    }
+}
+
 #[test]
 fn separate_process_registration_preview_approval_and_restore() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = disposable_tempdir();
     let source = fs::canonicalize(temp.path()).unwrap().join("source");
     let target = fs::canonicalize(temp.path()).unwrap().join("target");
     let state = fs::canonicalize(temp.path()).unwrap().join("state");
     fs::create_dir(&source).unwrap();
     fs::create_dir(&target).unwrap();
-    fs::write(source.join("hello.txt"), b"hello fixture").unwrap();
+    write_fixture(&source.join("hello.txt"), b"hello fixture");
     fs::write(source.join(".env"), b"TOKEN=DO_NOT_LEAK").unwrap();
     let registered = successful(
         &state,
@@ -57,12 +76,22 @@ fn separate_process_registration_preview_approval_and_restore() {
             "--approve",
             "wrong-plan",
             "--disposable-copies",
+            "--allow-permission-widening",
         ],
     );
     assert!(!refused.status.success());
     assert!(!target.join("hello.txt").exists());
-    // Approval alone cannot enable beta byte-only writes to an unacknowledged tree.
-    let missing_acknowledgement = run(&state, &["apply", plan_id, "--approve", plan_id]);
+    // Permission approval does not replace the disposable-copies acknowledgement.
+    let missing_acknowledgement = run(
+        &state,
+        &[
+            "apply",
+            plan_id,
+            "--approve",
+            plan_id,
+            "--allow-permission-widening",
+        ],
+    );
     assert!(!missing_acknowledgement.status.success());
     assert!(!target.join("hello.txt").exists());
     successful(
@@ -73,6 +102,7 @@ fn separate_process_registration_preview_approval_and_restore() {
             "--approve",
             plan_id,
             "--disposable-copies",
+            "--allow-permission-widening",
         ],
     );
     assert_eq!(
@@ -89,6 +119,7 @@ fn separate_process_registration_preview_approval_and_restore() {
             "--approve",
             plan_id,
             "--disposable-copies",
+            "--allow-permission-widening",
         ],
     );
     assert_eq!(
@@ -98,7 +129,16 @@ fn separate_process_registration_preview_approval_and_restore() {
     let undo = successful(&state, &["rollback-preview", plan_id]);
     let undo_id = undo["id"].as_str().expect("undo plan id");
     assert!(target.join("hello.txt").exists());
-    let missing_rollback_acknowledgement = run(&state, &["apply", undo_id, "--approve", undo_id]);
+    let missing_rollback_acknowledgement = run(
+        &state,
+        &[
+            "apply",
+            undo_id,
+            "--approve",
+            undo_id,
+            "--allow-permission-widening",
+        ],
+    );
     assert!(!missing_rollback_acknowledgement.status.success());
     assert!(target.join("hello.txt").exists());
     successful(
@@ -109,6 +149,7 @@ fn separate_process_registration_preview_approval_and_restore() {
             "--approve",
             undo_id,
             "--disposable-copies",
+            "--allow-permission-widening",
         ],
     );
     assert!(!target.join("hello.txt").exists());
@@ -119,13 +160,13 @@ fn separate_process_registration_preview_approval_and_restore() {
 
 #[test]
 fn stale_preview_cannot_overwrite_a_new_target_edit() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = disposable_tempdir();
     let source = fs::canonicalize(temp.path()).unwrap().join("source");
     let target = fs::canonicalize(temp.path()).unwrap().join("target");
     let state = fs::canonicalize(temp.path()).unwrap().join("state");
     fs::create_dir(&source).unwrap();
     fs::create_dir(&target).unwrap();
-    fs::write(source.join("code.txt"), b"incoming").unwrap();
+    write_fixture(&source.join("code.txt"), b"incoming");
     let pair = successful(
         &state,
         &[
@@ -140,7 +181,14 @@ fn stale_preview_cannot_overwrite_a_new_target_edit() {
     let id = plan["id"].as_str().unwrap();
     assert!(!run(
         &state,
-        &["apply", id, "--approve", id, "--disposable-copies"]
+        &[
+            "apply",
+            id,
+            "--approve",
+            id,
+            "--disposable-copies",
+            "--allow-permission-widening"
+        ]
     )
     .status
     .success());
@@ -148,12 +196,234 @@ fn stale_preview_cannot_overwrite_a_new_target_edit() {
 }
 
 #[test]
-fn beta_apply_help_explains_disposable_copy_and_mode_limit() {
-    let temp = tempfile::tempdir().unwrap();
+fn beta_apply_help_explains_disposable_copy_and_supported_permission_scope() {
+    let temp = disposable_tempdir();
     let output = run(temp.path(), &["apply", "--help"]);
     assert!(output.status.success());
     let help = String::from_utf8(output.stdout).unwrap();
     assert!(help.contains("--disposable-copies"));
     assert!(help.contains("never primary working trees"));
-    assert!(help.contains("do not preserve permissions or executable bits"));
+    assert!(help.contains("--allow-permission-widening"));
+    assert!(help.contains("basic rwx bits"));
+    assert!(help.contains("readonly only in current-user private directories"));
+    assert!(help.contains("special bits, custom ACLs and extended attributes"));
+    assert!(help.contains("canonical owner/SYSTEM/Admin"));
+    assert!(help.contains("planned permission widening"));
+}
+
+#[cfg(unix)]
+#[test]
+fn widening_requires_separate_approval_and_preserves_supported_mode_bits() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = disposable_tempdir();
+    let base = fs::canonicalize(temp.path()).unwrap();
+    let source = base.join("source");
+    let target = base.join("target");
+    let state = base.join("state");
+    fs::create_dir(&source).unwrap();
+    fs::create_dir(&target).unwrap();
+    write_fixture(&source.join("script.sh"), b"disposable script fixture");
+    let pair = successful(
+        &state,
+        &[
+            "register",
+            "Permission test",
+            source.to_str().unwrap(),
+            target.to_str().unwrap(),
+        ],
+    );
+    let preview = successful(&state, &["preview", pair["id"].as_str().unwrap()]);
+    let plan_id = preview["id"].as_str().unwrap();
+    assert_eq!(preview["operations"][0]["permission_widening"], true);
+    assert!(!run(
+        &state,
+        &[
+            "apply",
+            plan_id,
+            "--approve",
+            plan_id,
+            "--disposable-copies"
+        ]
+    )
+    .status
+    .success());
+    assert!(!target.join("script.sh").exists());
+    successful(
+        &state,
+        &[
+            "apply",
+            plan_id,
+            "--approve",
+            plan_id,
+            "--disposable-copies",
+            "--allow-permission-widening",
+        ],
+    );
+    assert_eq!(
+        fs::metadata(target.join("script.sh"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o644
+    );
+    fs::set_permissions(source.join("script.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+    let chmod_plan = successful(&state, &["preview", pair["id"].as_str().unwrap()]);
+    assert_eq!(chmod_plan["operations"][0]["kind"], "permissions");
+    assert_eq!(chmod_plan["operations"][0]["permission_widening"], true);
+    let chmod_id = chmod_plan["id"].as_str().unwrap();
+    assert!(!run(
+        &state,
+        &[
+            "apply",
+            chmod_id,
+            "--approve",
+            chmod_id,
+            "--disposable-copies"
+        ]
+    )
+    .status
+    .success());
+    assert_eq!(
+        fs::metadata(target.join("script.sh"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o644
+    );
+    successful(
+        &state,
+        &[
+            "apply",
+            chmod_id,
+            "--approve",
+            chmod_id,
+            "--disposable-copies",
+            "--allow-permission-widening",
+        ],
+    );
+    assert_eq!(
+        fs::metadata(target.join("script.sh"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755
+    );
+    let undo = successful(&state, &["rollback-preview", chmod_id]);
+    let undo_id = undo["id"].as_str().unwrap();
+    successful(
+        &state,
+        &[
+            "apply",
+            undo_id,
+            "--approve",
+            undo_id,
+            "--disposable-copies",
+            "--allow-permission-widening",
+        ],
+    );
+    assert_eq!(
+        fs::metadata(target.join("script.sh"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o644
+    );
+    assert_eq!(
+        fs::read(target.join("script.sh")).unwrap(),
+        b"disposable script fixture"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_readonly_widening_requires_separate_approval_and_rolls_back() {
+    fn readonly(path: &Path, value: bool) {
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_readonly(value);
+        fs::set_permissions(path, permissions).unwrap();
+    }
+    let temp = disposable_tempdir();
+    let base = fs::canonicalize(temp.path()).unwrap();
+    let source = base.join("source");
+    let target = base.join("target");
+    let state = base.join("state");
+    fs::create_dir(&source).unwrap();
+    fs::create_dir(&target).unwrap();
+    let source_file = source.join("script.txt");
+    let target_file = target.join("script.txt");
+    write_fixture(&source_file, b"disposable readonly fixture");
+    readonly(&source_file, true);
+    let pair = successful(
+        &state,
+        &[
+            "register",
+            "Readonly test",
+            source.to_str().unwrap(),
+            target.to_str().unwrap(),
+        ],
+    );
+    let preview = successful(&state, &["preview", pair["id"].as_str().unwrap()]);
+    assert_eq!(
+        preview["operations"][0]["permissions_after"],
+        serde_json::json!({"platform":"windows","readonly":true})
+    );
+    let id = preview["id"].as_str().unwrap();
+    successful(
+        &state,
+        &["apply", id, "--approve", id, "--disposable-copies"],
+    );
+    assert!(fs::metadata(&target_file).unwrap().permissions().readonly());
+    readonly(&source_file, false);
+    let widening = successful(&state, &["preview", pair["id"].as_str().unwrap()]);
+    assert_eq!(widening["operations"][0]["kind"], "permissions");
+    assert_eq!(widening["operations"][0]["permission_widening"], true);
+    let widening_id = widening["id"].as_str().unwrap();
+    assert!(!run(
+        &state,
+        &[
+            "apply",
+            widening_id,
+            "--approve",
+            widening_id,
+            "--disposable-copies"
+        ]
+    )
+    .status
+    .success());
+    assert!(fs::metadata(&target_file).unwrap().permissions().readonly());
+    successful(
+        &state,
+        &[
+            "apply",
+            widening_id,
+            "--approve",
+            widening_id,
+            "--disposable-copies",
+            "--allow-permission-widening",
+        ],
+    );
+    assert!(!fs::metadata(&target_file).unwrap().permissions().readonly());
+    let rollback = successful(&state, &["rollback-preview", widening_id]);
+    let rollback_id = rollback["id"].as_str().unwrap();
+    successful(
+        &state,
+        &[
+            "apply",
+            rollback_id,
+            "--approve",
+            rollback_id,
+            "--disposable-copies",
+        ],
+    );
+    assert!(fs::metadata(&target_file).unwrap().permissions().readonly());
+    assert_eq!(
+        fs::read(&target_file).unwrap(),
+        b"disposable readonly fixture"
+    );
+    // Tempfile cleanup can remove this generated file after the assertions.
+    readonly(&target_file, false);
 }

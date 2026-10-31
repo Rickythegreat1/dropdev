@@ -8,6 +8,7 @@ import {
   type Plan,
   type Receipt,
   type Operation,
+  type FilePermissions,
 } from "../data/client";
 
 const routes = [
@@ -33,6 +34,7 @@ export function App() {
   const [preview, setPreview] = React.useState<Plan | null>(null);
   const [receipt, setReceipt] = React.useState<Receipt | null>(null);
   const [approval, setApproval] = React.useState(false);
+  const [accessApproval, setAccessApproval] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState("");
   const [handoff, setHandoff] = React.useState<unknown>(null);
@@ -85,6 +87,7 @@ export function App() {
     setPreview(null);
     setReceipt(null);
     setApproval(false);
+    setAccessApproval(false);
     setHandoff(null);
   }
   async function buildPreview() {
@@ -92,10 +95,13 @@ export function App() {
     await run(async () => {
       setReceipt(null);
       setApproval(false);
+      setAccessApproval(false);
       setPreview(await command<Plan>({ action: "preview", pair_id: pair.id }));
       setRoute("sync-queue");
     });
   }
+  const hasAccessIncrease =
+    preview?.operations.some((o) => o.permission_widening) ?? false;
   const readyToApply =
     preview &&
     preview.state === "planned" &&
@@ -173,9 +179,9 @@ export function App() {
         </header>
         <div className="betaBanner" role="note" aria-label="Beta safety limit">
           <strong>Experimental beta — disposable project copies only.</strong>{" "}
-          Never register or sync primary working trees. Replacement and rollback
-          copy content only; file permissions and executable bits are not
-          preserved.
+          Never register or sync primary working trees. Supported Unix rwx bits
+          and Windows readonly are preserved. ACLs, ownership and xattrs are
+          unsupported or blocked; Windows has no Unix executable-bit equivalent.
         </div>
         {!native && (
           <div className="demoBanner">
@@ -280,6 +286,7 @@ export function App() {
                   invalidate={() => {
                     setPreview(null);
                     setApproval(false);
+                    setAccessApproval(false);
                   }}
                 />
               )}
@@ -503,12 +510,41 @@ export function App() {
                       />
                       I reviewed all paths in <code>{preview.id}</code> and
                       confirm these are disposable copies, never primary working
-                      trees. I understand beta replacement and rollback do not
-                      preserve file permissions or executable bits.
+                      trees. I understand only supported Unix rwx bits or
+                      Windows readonly are preserved; ACLs, ownership and xattrs
+                      are unsupported or blocked.
                     </label>
+                    {hasAccessIncrease && (
+                      <div className="warningCopy accessApproval">
+                        <strong>
+                          This plan increases access on the listed paths.
+                        </strong>
+                        <p>
+                          Review every before → after permission change above.
+                          Broader Unix rwx bits or removing Windows readonly
+                          requires separate approval.
+                        </p>
+                        <label className="checkbox">
+                          <input
+                            type="checkbox"
+                            checked={accessApproval}
+                            disabled={!readyToApply || busy}
+                            onChange={(e) =>
+                              setAccessApproval(e.target.checked)
+                            }
+                          />
+                          I approve the listed access increases
+                        </label>
+                      </div>
+                    )}
                     <button
                       className="primary"
-                      disabled={!readyToApply || !approval || busy}
+                      disabled={
+                        !readyToApply ||
+                        !approval ||
+                        (hasAccessIncrease && !accessApproval) ||
+                        busy
+                      }
                       onClick={() =>
                         run(async () => {
                           const r = await command<Receipt>({
@@ -516,9 +552,11 @@ export function App() {
                             plan_id: preview.id,
                             approval: preview.id,
                             disposable_copies: approval,
+                            allow_permission_widening: accessApproval,
                           });
                           setReceipt(r);
                           setApproval(false);
+                          setAccessApproval(false);
                           setPreview({ ...preview, state: r.state });
                         })
                       }
@@ -577,6 +615,7 @@ export function App() {
                                       }),
                                     );
                                     setApproval(false);
+                                    setAccessApproval(false);
                                     setReceipt(null);
                                     setRoute("sync-queue");
                                   })
@@ -609,6 +648,7 @@ export function App() {
                   invalidate={() => {
                     setPreview(null);
                     setApproval(false);
+                    setAccessApproval(false);
                   }}
                 />
               )}
@@ -742,6 +782,7 @@ export function App() {
                                 }),
                               );
                               setApproval(false);
+                              setAccessApproval(false);
                               setReceipt(null);
                               setRoute("sync-queue");
                             })
@@ -843,6 +884,7 @@ export function App() {
                       setPreview(null);
                       setReceipt(null);
                       setApproval(false);
+                      setAccessApproval(false);
                     })
                   }
                 >
@@ -929,8 +971,9 @@ function OperationTable({ operations }: { operations: Operation[] }) {
           <tr>
             <th>Path / side</th>
             <th>Action</th>
-            <th>Replica before</th>
+            <th>Content before</th>
             <th>After / incoming</th>
+            <th>Permissions before → after</th>
           </tr>
         </thead>
         <tbody>
@@ -954,17 +997,37 @@ function OperationTable({ operations }: { operations: Operation[] }) {
               <td>
                 <code title={o.after ?? "Absent"}>{hash(o.after)}</code>
               </td>
+              <td className="permissionPreview">
+                <code>
+                  {formatPermissions(o.permissions_before)} →{" "}
+                  {formatPermissions(o.permissions_after)}
+                </code>
+                {o.permission_widening && (
+                  <strong className="accessIncrease">
+                    Access increase · extra approval required
+                  </strong>
+                )}
+              </td>
             </tr>
           ))}
           {!operations.length && (
             <tr>
-              <td colSpan={4}>No eligible path changes in this scan.</td>
+              <td colSpan={5}>No eligible path changes in this scan.</td>
             </tr>
           )}
         </tbody>
       </table>
     </div>
   );
+}
+function formatPermissions(value: FilePermissions | null | undefined) {
+  if (value === undefined) return "Not recorded";
+  if (value === null) return "Absent";
+  return value.platform === "unix"
+    ? `Unix 0${value.mode.toString(8).padStart(3, "0")}`
+    : value.readonly
+      ? "Windows read-only"
+      : "Windows writable";
 }
 function DemoTools({
   busy,
@@ -979,7 +1042,8 @@ function DemoTools({
     <section className="demoTools">
       <p className="eyebrow">Explore the disposable workspace</p>
       <p>
-        Apply a first preview, then simulate a source edit or divergent changes.
+        Apply a first preview, then simulate source content, permission or
+        divergent changes.
       </p>
       <div className="toolbar">
         <button
@@ -992,6 +1056,17 @@ function DemoTools({
           }
         >
           Simulate source edit
+        </button>
+        <button
+          disabled={busy}
+          onClick={() =>
+            run(async () => {
+              await command({ action: "demo_permissions" });
+              invalidate();
+            })
+          }
+        >
+          Simulate executable permission
         </button>
         <button
           disabled={busy}
