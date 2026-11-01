@@ -341,3 +341,88 @@ passing runtime/test gates; a scoped example lint pass may allow those known
 style categories, without treating that as a clean strict whole-core lint.
 The scoped example Clippy pass succeeded with command-line allowances for those
 two existing style categories; it reported no additional example warnings.
+
+## 2026-10-31 — Authenticated local peer transport and explicit pairing
+
+1. **Task/scope.** Implement real mutually authenticated proposal transport and
+   explicit fingerprint pairing, within ephemeral/disposable localhost scope.
+   Touched files: new devdrop-peer crate (pairing, wire, transport, private queue,
+   acceptance example/tests), workspace manifest/lockfile, existing CI evidence
+   step, transport documentation/review and this log. No application UI or
+   filesystem-mutating daemon endpoint is added.
+2. **Risk and authority.** High: authentication, network input, data persistence,
+   quotas and sync approvals. Use standard Rustls TLS1.3 with mandatory client
+   certificates and exact leaf pins approved locally on both ends. Ephemeral
+   private keys stay in RAM; no production credentials, real devices, user
+   projects, Docker, public listener, firewall/VPN change or paid provisioning.
+3. **Implementation plan.** Expiring/revocable pairing binds random offers,
+   fingerprints and exact bounded scope. Strict framed proposals bind identity,
+   channel, sequence/predecessor and integrity; per-path/deletion/data quotas.
+   TLS acceptance stores a private proposal plus replay cursor in one SQLite
+   transaction. It never applies a workspace change. Local generated acceptance
+   fixtures explicitly review/stage then call existing Engine preview, exact
+   plan/disposable/widening approvals, conflict resolution and rollback.
+4. **Tests/evals.** Real loopback TLS handshake and transfer, two-way explicit
+   pairing, unpaired/wrong certificate/pin/scope/expiry/revocation failures,
+   invalid/oversize/hash-tampered frames and remote-apply refusal, ACK loss and
+   reconnect/idempotent replay/collision, durable queue reopen and quotas. Real
+   Engine fixture checks for offline edit conflicts, tombstone deletion,
+   original-inode recovery and separate permission consent. Redaction canary
+   ensures reports/debug/errors omit payload and private key material.
+5. **UX/truthfulness.** No UI changes. Reports distinguish authenticated
+   localhost prototype from earlier multi-VM artifact relay. Receiving/queueing
+   is not applying; pairing is not unattended-write authority. No production
+   credential lifecycle or network-device acceptance is claimed. Required
+   independent security/sync review covers these boundaries.
+6. **Closeout pending.** Run targeted/full/platform checks and update same
+   portable handoff with exact evidence. Current managed executor has no KVM,
+   VM runtime, VPN, peer TCP grants or cloud identity; standard CI VM jobs lack
+   a configured approved private peer route. Real VM TLS acceptance needs two
+   approved privately reachable disposable endpoints and permission to bind
+   their private interfaces; no public-port/VPN workaround will be attempted.
+   Existing denied PR and Sites-helper blocker are unchanged.
+
+### Local transport implementation checkpoint
+
+The new peer library passed 18 tests; the authenticated localhost Engine example
+passed 1 test plus 14 acceptance checks. Independent review ran both and found no
+auth bypass in this scope. Full workspace tests, all-target checking, optimized
+builds and scoped Clippy passed. Scope/digest/cursor/payload/event persistence is
+transactional, including a trigger-abort regression and reopen. Receipt counts
+were corrected to be per pair, tested with two grants sharing a private queue.
+Exact leafpin rejection is tested after otherwise-valid WebPKI both directions;
+no-client/unpaired cert failures occur in mandatory TLS authentication itself.
+
+The fixture example stops its actual loopback listener, reopens the durable queue
+and reconnects with the same RAM-only pairing. It validates local staging digest,
+disposable intent, stale-delete predecessor, Core conflict/keep both and exact
+approved apply, original inode/metadata rollback and separate widening approval.
+Neither packet receipt nor pairing authorizes workspace writes. Native CI now
+runs this acceptance example on each existing OS job; dedicated Linux JSON/log
+proof is clearly localhost, not an additional VM or direct-device test.
+
+Targeted primary advisory checking found the old workspace Tokio 1.52.3 falls in
+the AsyncFd I/O-safety advisory range. Only Tokio was advanced to 1.54.1 among
+preexisting package versions; unrelated lockfile updates were discarded. The
+separate Tauri lockfile already used 1.54.1. New TLS minimums require Rustls 0.23.46,
+tokio-rustls 0.26.6 and ring 0.17.14; locked WebPKI 0.103.16 has the current fix.
+No claim of a complete dependency audit is made. Tests/checks/release/scoped lint
+were rerun after the targeted update. Strict whole-core Clippy still has the
+previously documented unrelated production style findings; the scoped pass
+allows only those two existing categories.
+
+Revocation is local to each grant and stops new admissions; an already-admitted
+transaction can finish. Network timeout/lost acknowledgement outcome is unknown until exact
+retry and does not imply no proposal was stored. Pending recovery evidence stays
+reviewable after expiry/revocation. Keys and sender retry outbox remain RAM-only;
+no process-kill, persistent-device lifecycle or cross-VM TLS guarantee is made.
+Final exact-source CI/platform and previous artifactrelay results belong in the
+updated handoff. No denied PR, Sites route, account or security change was retried.
+
+Final local correction checks passed: **142 workspace tests**, including 19 peer
+tests on Unix, plus **1 localhost integration test and 14 acceptance checks**.
+Windows has 18 peer tests because the generated FIFO regression is Unix-only.
+State paths now reject special files before open and use nonblocking/no-follow
+handles, with a generated FIFO regression. Formatting, all-target checking,
+scoped Clippy and optimized workspace builds passed after these corrections.
+Native platform results remain pending until the exact-source CI run is terminal.

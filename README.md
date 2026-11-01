@@ -160,3 +160,22 @@ store-and-forward test, with simulated offline/reconnect faults. It does not
 implement production peer networking, pairing or authentication. See the
 [exact topology and acceptance boundary](docs/peer-simulation.md) before using
 its results as cross-device evidence.
+
+## Authenticated localhost peer prototype
+
+`devdrop-peer` adds explicit, expiring fingerprint pairing and a real mutually
+verified TLS1.3 proposal channel. Network receipt stores a bounded private
+proposal for local review; it cannot apply project files. Keys remain in RAM.
+
+```sh
+cargo test -p devdrop-peer --all-targets --locked
+cargo run -p devdrop-peer --example localhost --locked
+```
+
+The example accepts no project/device/credential arguments and uses generated
+fixtures only. It exercises local approval, offline/reconnect, conflicts,
+deletion/rollback and permissions over real loopback TLS. This is a library
+prototype; native pairing UI, durable production identities and direct
+cross-device networking are still outstanding. See [transport scope](docs/peer-transport.md)
+and [security review](docs/peer-transport-review.md). The earlier VM artifact
+relay must not be described as authenticated peer-network acceptance.

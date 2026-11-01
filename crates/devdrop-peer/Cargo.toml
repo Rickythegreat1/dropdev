@@ -1,0 +1,25 @@
+[package]
+name = "devdrop-peer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+blake3.workspace = true
+devdrop-core = { path = "../devdrop-core" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+rustls = { version = "0.23.46", default-features = false, features = ["std", "ring"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring"] }
+rcgen = { version = "0.13.2", default-features = false, features = ["crypto", "ring"] }
+ring = "0.17.14"
+rusqlite = { version = "0.32", features = ["bundled"] }
+fs2 = "0.4"
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

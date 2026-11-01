@@ -27,6 +27,54 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo test --workspace --locked
       - run: cargo check --workspace --all-targets --locked
+      - name: Exercise authenticated localhost peers (loopback only)
+        run: cargo run -p devdrop-peer --example localhost --locked > "${RUNNER_TEMP}/devdrop-authenticated-localhost.json"
+      - name: Validate and log bounded sanitized localhost evidence
+        run: |
+          python3 - <<'PY'
+          import json, os, re
+          from pathlib import Path
+          path = Path(os.environ['RUNNER_TEMP']) / 'devdrop-authenticated-localhost.json'
+          assert path.is_file() and not path.is_symlink() and 0 < path.stat().st_size <= 65536
+          with path.open('rb') as stream:
+              encoded = stream.read(65537)
+          assert len(encoded) <= 65536
+          report = json.loads(encoded)
+          assert report['schema'] == 'devdrop-authenticated-localhost-evidence/v1'
+          topology = report['topology']
+          assert type(topology['machines']) is int and topology['machines'] == 1
+          assert type(topology['processes']) is int and topology['processes'] == 1
+          assert topology['cross_device_network_acceptance'] is False
+          assert topology['host_os'] == 'linux' and topology['architecture'] == 'x86_64'
+          assert report['transport'] == 'mutual TLS1.3 with exact leaf pins and ALPN checks on both endpoints'
+          pairing = report['pairing']
+          for key in ('id', 'sender_fingerprint', 'receiver_fingerprint'):
+              assert re.fullmatch(r'[0-9a-f]{64}', pairing[key])
+          assert pairing['sender_fingerprint'] != pairing['receiver_fingerprint']
+          assert pairing['confirmed_on_both_ends'] is True
+          assert len(report['checks']) == 14
+          checks = []
+          for check in report['checks']:
+              assert re.fullmatch(r'[a-z0-9_]{1,128}', check['name'])
+              assert check['passed'] is True
+              checks.append({'name': check['name'], 'passed': True})
+          assert len({check['name'] for check in checks}) == 14
+          summary = {
+              'schema': report['schema'],
+              'topology': {key: topology[key] for key in ('machines', 'processes', 'cross_device_network_acceptance', 'host_os', 'architecture')},
+              'transport': report['transport'],
+              'pairing': {key: pairing[key] for key in ('id', 'sender_fingerprint', 'receiver_fingerprint', 'confirmed_on_both_ends')},
+              'checks': checks,
+          }
+          print('AUTHENTICATED_LOCALHOST_EVIDENCE=' + json.dumps(summary, sort_keys=True))
+          PY
+      - name: Save sanitized authenticated localhost evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: devdrop-authenticated-localhost-evidence
+          path: ${{ runner.temp }}/devdrop-authenticated-localhost.json
+          if-no-files-found: error
+          retention-days: 7
 
   desktop:
     name: Desktop workflow tests and web build

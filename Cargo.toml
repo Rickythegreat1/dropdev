@@ -4,6 +4,7 @@ members = [
   "crates/devdrop-cli",
   "crates/devdrop-daemon",
   "crates/devdrop-mcp",
+  "crates/devdrop-peer",
 ]
 resolver = "2"
 exclude = ["apps/desktop/src-tauri"]
@@ -23,7 +24,7 @@ serde_json = "1.0"
 thiserror = "2.0"
 axum = "0.7"
 notify = "6.1"
-tokio = { version = "1.38", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1.54.1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time", "io-util"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
