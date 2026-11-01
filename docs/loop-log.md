@@ -526,3 +526,48 @@ privileged smoke package commands with a 15-second outer grace. Readiness's
 sole privileged index refresh discards unused output and reports unexpected
 outer timeout as uncertain cleanup. The updated pure safety suites passed
 12 installer checks and six readiness checks without privileged local execution.
+
+## 2026-11-01 — Approved isolated guest-to-guest TLS acceptance
+
+1. **Restatement.** Run real authenticated proposal transfer between two QEMU
+   Linux guests on one existing public CI runner, following explicit action-time
+   approval of this exact isolated network. Preserve the passing `54e0cd2`
+   checkpoint. Proposal receipt never authorizes workspace application.
+2. **Touched files.** Peer crate Cargo feature/config, a separately gated
+   transport adapter and `examples/vm_peer.rs`; new isolated transport Python
+   driver/safety tests, opt-in CI workflow, this log, peer test plan and independent
+   `docs/isolated-vm-transport-review.md`. Default desktop/CLI/peer binding policy
+   stays loopback-only. No production pairing or public endpoint is added.
+3. **Risk and boundaries.** High: guest networking, temporary disks and process
+   control. Exact guests A `10.77.0.1/30`, B `10.77.0.2/30`; only B TLS port 37431
+   accepts A. Use an AF_UNIX socketpair virtual cable, one vCPU/512 MiB per guest,
+   generated disks, RAM-only identities, no bridge/NAT/DNS/default gateway,
+   host firewall/VPN change, public listener, persistent access, spending or real
+   projects. Network lifetime is bounded at 30 minutes; stop/wait both emulators,
+   close cable FDs and delete generated assets on every path. PID1 init owns
+   fixed guest controls; no generic shell/address/path API is exposed.
+4. **Tests.** Unit-check default refusal and exact test-only address/source
+   allowlist, strict public serial schema, CI refusal, package/module/library
+   extraction paths, fixed QEMU network flags, deadlines and cleanup. In actual
+   guests verify independent kernels/state/identities, mutual TLS transfer,
+   replay, tamper/scope refusal, NIC down/up, actual worker kill/restart, real B
+   kernel reboot with durable queue and fresh explicit pairing. Distinguish
+   interruption from process death, guest reboot and power-loss guarantees.
+5. **UX/truthfulness.** No product UI change. Fixed fixture confirmations are
+   test approvals, not real-device human pairing. Report proposal-only behavior,
+   RAM sender-outbox loss and incomplete production identity/UI integration.
+   Preserve primary-tree prohibition and constrained permission policy.
+6. **Closeout gate.** Independent sync/security review before enabling the CI
+   network job. Use explicit opt-in commit marker on the existing branch so
+   unrelated future pushes do not automatically run this network lab. Keep exact
+   commands/commit/run proofs, failed checkpoints and never-run cases in the same
+   Library handoff. No denied PR retry or Sites workaround is authorized.
+
+Pre-CI implementation closeout: full local workspace passed145tests (two internal
+child helpers intentionally ignored by the ordinary runner and invoked by parent
+regressions); feature-enabled peer passed22 plus localhost1/process2/worker2
+tests. Python transport safety/model tests passed13. Formatting/scoped Clippy
+passed with only the two previously documented core style categories allowed.
+Independent review found no critical outstanding issue, and corrected per-pair
+versus total queue receipt checks and specific old-pin failure evidence. Actual
+guest networking remains unrun until the explicit opt-in CI commit executes.

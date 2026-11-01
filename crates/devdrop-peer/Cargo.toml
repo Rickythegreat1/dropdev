@@ -4,6 +4,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+vm-fixture = []
+
+[[example]]
+name = "vm_peer"
+required-features = ["vm-fixture"]
+
 [dependencies]
 blake3.workspace = true
 devdrop-core = { path = "../devdrop-core" }

@@ -1,0 +1,46 @@
+name: Isolated guest TLS acceptance
+
+on:
+  push:
+    branches: ["codex/local-sync-mvp-20261031"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: isolated-guest-transport-${{ github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  # Explicit opt-in for the specifically approved disposable lab. A normal push
+  # must never start guest networking. Future uses require their own scope check.
+  isolated_transport:
+    if: github.event.repository.private == false && startsWith(github.event.head_commit.message, '[isolated-vm-test] ')
+    runs-on: ubuntu-22.04
+    timeout-minutes: 35
+    env:
+      DEVDROP_PUBLIC_REPOSITORY: ${{ github.event.repository.private == false }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+      - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a
+      - name: Test default peer policy and compiled fixture adapter
+        run: |
+          cargo test -p devdrop-peer --all-targets --locked
+          cargo test -p devdrop-peer --all-targets --features vm-fixture --locked
+      - name: Check guest harness safety without guest execution
+        run: python3 -B scripts/test-isolated-vm-transport.py
+      - name: Build separately gated guest worker
+        run: cargo build -p devdrop-peer --example vm_peer --features vm-fixture --release --locked
+      - name: Run approved isolated two-guest TLS fixture
+        run: python3 -B scripts/isolated-vm-transport.py --worker target/release/examples/vm_peer --output "${RUNNER_TEMP}/devdrop-isolated-vm-transport.json"
+      - name: Preserve sanitized guest acceptance and cleanup evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: devdrop-isolated-vm-transport-evidence
+          path: ${{ runner.temp }}/devdrop-isolated-vm-transport.json
+          if-no-files-found: error
+          retention-days: 7

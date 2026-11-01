@@ -1,4 +1,5 @@
-//! Loopback-only TLS1.3 mutual authentication. One bounded proposal per connection.
+//! Loopback-only by default: TLS1.3 mutual authentication and one bounded proposal.
+//! The off-default VM fixture adapter is a fixed, isolated two-guest test only.
 //! Authentication permits durable queueing only: no API reads or applies projects.
 use crate::{
     pairing::{Paired, ALPN, SERVER_NAME},
@@ -99,6 +100,9 @@ impl PeerClient {
         let stream = TcpStream::connect(address)
             .await
             .map_err(|_| PeerError("Loopback peer connection unavailable."))?;
+        self.exchange(stream, envelope).await
+    }
+    async fn exchange(&self, stream: TcpStream, envelope: &Envelope) -> PeerResult<Receipt> {
         let mut tls = self
             .connector
             .connect(
@@ -185,6 +189,9 @@ impl PeerServer {
             .await
             .map_err(|_| PeerError("Loopback peer accept failed."))?;
         loopback(address)?;
+        self.authenticated_request(stream).await
+    }
+    async fn authenticated_request(&self, stream: TcpStream) -> PeerResult<Receipt> {
         let mut tls = self
             .acceptor
             .accept(stream)
@@ -221,6 +228,196 @@ impl PeerServer {
     }
 }
 
+/// Separately compiled, off by default. This is the exact disposable two-guest
+/// cable fixture, not a general private-network endpoint or product LAN mode.
+#[cfg(feature = "vm-fixture")]
+pub mod vm_fixture {
+    use super::*;
+    use crate::{pairing::Scope, wire::Change};
+    use std::{
+        collections::BTreeSet,
+        net::{IpAddr, Ipv4Addr},
+    };
+    use tokio::net::TcpSocket;
+    pub const CLIENT_IP: Ipv4Addr = Ipv4Addr::new(10, 77, 0, 1);
+    pub const SERVER_ADDRESS: SocketAddr =
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 77, 0, 2)), 37431);
+    pub const FIXTURE_PATH: &str = "src/shared.txt";
+    pub const FIXTURE_BYTES: &[u8] = b"generated private guest TLS fixture\n";
+    pub fn scope() -> Scope {
+        Scope {
+            channel: "isolated-two-guest-fixture".into(),
+            paths: BTreeSet::from([FIXTURE_PATH.into()]),
+            allow_delete: false,
+            max_messages: 1,
+            max_bytes_per_proposal: 4096,
+            max_total_bytes: 4096,
+        }
+    }
+    fn validate_scope(pair: &Paired) -> PeerResult<()> {
+        pair.ensure_active()?;
+        if pair.scope() != &scope() {
+            return Err(PeerError("Isolated VM fixture scope must match exactly."));
+        }
+        Ok(())
+    }
+    fn admitted(address: SocketAddr) -> PeerResult<()> {
+        if address.ip() != IpAddr::V4(CLIENT_IP) {
+            Err(PeerError("Isolated VM fixture accepts guest A only."))
+        } else {
+            Ok(())
+        }
+    }
+    fn selected(envelope: &Envelope) -> PeerResult<()> {
+        match envelope.changes.as_slice() {
+            [Change::Put { path, bytes, .. }] if path == FIXTURE_PATH && bytes == FIXTURE_BYTES => {
+                Ok(())
+            }
+            _ => Err(PeerError(
+                "Isolated VM fixture sends fixed generated content only.",
+            )),
+        }
+    }
+    #[derive(Clone, Copy)]
+    pub enum Fault {
+        HashMismatch,
+        DeleteOutsideScope,
+        SequenceQuota,
+    }
+    pub struct Client(PeerClient);
+    impl Client {
+        pub fn new(pair: Paired) -> PeerResult<Self> {
+            validate_scope(&pair)?;
+            Ok(Self(PeerClient::new(pair)?))
+        }
+        pub async fn send(&self, envelope: &Envelope) -> PeerResult<Receipt> {
+            envelope.validate_outgoing(&self.0.pair)?;
+            selected(envelope)?;
+            self.send_selected(envelope).await
+        }
+        /// Fixed negative mutations for this isolated fixture only. The receiver
+        /// still runs the complete production TLS/pin/schema/scope/hash checks.
+        pub async fn send_fault(&self, envelope: &Envelope, fault: Fault) -> PeerResult<Receipt> {
+            envelope.validate_outgoing(&self.0.pair)?;
+            selected(envelope)?;
+            let mut changed = envelope.clone();
+            match fault {
+                Fault::HashMismatch => {
+                    if let Change::Put { bytes, .. } = &mut changed.changes[0] {
+                        bytes[0] ^= 1;
+                    }
+                }
+                Fault::DeleteOutsideScope => {
+                    if let Change::Put { path, hash, .. } = &changed.changes[0] {
+                        changed.changes = vec![Change::Delete {
+                            path: path.clone(),
+                            previous_hash: hash.clone(),
+                        }];
+                    }
+                }
+                Fault::SequenceQuota => {
+                    changed.sequence = u64::from(self.0.pair.scope().max_messages) + 1
+                }
+            }
+            self.send_selected(&changed).await
+        }
+        async fn send_selected(&self, envelope: &Envelope) -> PeerResult<Receipt> {
+            validate_scope(&self.0.pair)?;
+            timeout(REQUEST_TIMEOUT, async {
+                let socket = TcpSocket::new_v4()
+                    .map_err(|_| PeerError("Guest fixture socket unavailable."))?;
+                socket
+                    .bind(SocketAddr::new(IpAddr::V4(CLIENT_IP), 0))
+                    .map_err(|_| {
+                        PeerError("Guest A fixture address is unavailable; no fallback is allowed.")
+                    })?;
+                let stream = socket
+                    .connect(SERVER_ADDRESS)
+                    .await
+                    .map_err(|_| PeerError("Exact guest B fixture connection unavailable."))?;
+                if stream
+                    .local_addr()
+                    .map_err(|_| PeerError("Guest local address unavailable."))?
+                    .ip()
+                    != IpAddr::V4(CLIENT_IP)
+                    || stream
+                        .peer_addr()
+                        .map_err(|_| PeerError("Guest peer address unavailable."))?
+                        != SERVER_ADDRESS
+                {
+                    return Err(PeerError(
+                        "Guest fixture socket is outside the exact cable scope.",
+                    ));
+                }
+                self.0.exchange(stream, envelope).await
+            })
+            .await
+            .map_err(|_| {
+                PeerError("Guest fixture request timed out; queue outcome may be uncertain.")
+            })?
+        }
+    }
+    pub struct Server(PeerServer);
+    impl Server {
+        pub async fn bind(pair: Paired, inbox: Arc<Mutex<Inbox>>) -> PeerResult<Self> {
+            validate_scope(&pair)?;
+            let acceptor = TlsAcceptor::from(pair.server_config()?);
+            let listener = TcpListener::bind(SERVER_ADDRESS).await.map_err(|_| {
+                PeerError("Exact guest B fixture bind unavailable; no fallback is allowed.")
+            })?;
+            Ok(Self(PeerServer {
+                pair,
+                inbox,
+                listener,
+                acceptor,
+            }))
+        }
+        pub fn local_addr(&self) -> PeerResult<SocketAddr> {
+            self.0.local_addr()
+        }
+        pub async fn serve_one(&self) -> PeerResult<Receipt> {
+            self.0.pair.ensure_active()?;
+            timeout(REQUEST_TIMEOUT, async {
+                let (stream, address) = self
+                    .0
+                    .listener
+                    .accept()
+                    .await
+                    .map_err(|_| PeerError("Guest fixture accept failed."))?;
+                admitted(address)?; // Reject every source except A before TLS.
+                self.0.authenticated_request(stream).await
+            })
+            .await
+            .map_err(|_| {
+                PeerError(
+                    "Guest fixture request timed out; an admitted queue transaction may finish.",
+                )
+            })?
+        }
+    }
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        #[test]
+        fn exact_cable_guard_has_no_private_range_wildcard_or_loopback_exception() {
+            assert!(admitted("10.77.0.1:50000".parse().unwrap()).is_ok());
+            for address in [
+                "10.77.0.2:50000",
+                "10.77.0.3:50000",
+                "10.77.1.1:50000",
+                "127.0.0.1:50000",
+                "0.0.0.0:50000",
+                "192.168.1.1:50000",
+            ] {
+                assert!(admitted(address.parse().unwrap()).is_err());
+            }
+            assert_eq!(SERVER_ADDRESS, "10.77.0.2:37431".parse().unwrap());
+            assert!(super::super::loopback(SERVER_ADDRESS).is_err());
+            assert!(super::super::loopback(SocketAddr::new(IpAddr::V4(CLIENT_IP), 0)).is_err());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -233,6 +430,12 @@ mod tests {
     };
     use rustls::{pki_types::CertificateDer, ClientConfig, RootCertStore};
     use std::{path::Path, time::Instant};
+    #[test]
+    fn default_transport_refuses_both_private_fixture_endpoints() {
+        for address in ["10.77.0.1:1", "10.77.0.2:37431", "0.0.0.0:37431"] {
+            assert!(loopback(address.parse().unwrap()).is_err());
+        }
+    }
     fn temp() -> tempfile::TempDir {
         let temp = tempfile::tempdir().unwrap();
         #[cfg(windows)]
