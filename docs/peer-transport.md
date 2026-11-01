@@ -10,7 +10,10 @@ simulation: it does not establish that this TLS protocol works between devices.
 Each pairing flow generates an ephemeral certificate/private key in RAM and a
 random public offer nonce. Both peers must explicitly confirm the other's exact
 certificate fingerprint and the same bounded scope. There is no automatic
-trust-on-first-use endpoint. The session binds both offers and the scope, expires
+trust-on-first-use endpoint. A product must compare fingerprints through a
+trusted out-of-band channel or directly between the two displays; it must not
+automatically echo an unverified offered fingerprint into approval. The fixture
+driver supplies confirmations only because it generated both local identities. The session binds both offers and the scope, expires
 within five minutes and can be revoked locally. Each endpoint owns its own
 grant; local revocation is not a broadcast unlink operation. It prevents new
 admissions at that endpoint; an already admitted queue transaction may finish. Restarting without the in-memory identity

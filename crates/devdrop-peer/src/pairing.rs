@@ -521,9 +521,8 @@ pub(crate) mod tests {
             } else {
                 b.remote_fingerprint = ZERO_DIGEST.into();
             }
-            let inbox = Arc::new(Mutex::new(
-                Inbox::create_new(&temp.path().join("queue")).unwrap(),
-            ));
+            let root = std::fs::canonicalize(temp.path()).unwrap();
+            let inbox = Arc::new(Mutex::new(Inbox::create_new(&root.join("queue")).unwrap()));
             let server = Arc::new(
                 PeerServer::bind(b, inbox.clone(), "127.0.0.1:0".parse().unwrap())
                     .await

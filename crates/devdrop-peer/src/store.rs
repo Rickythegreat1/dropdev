@@ -175,11 +175,21 @@ fn sync_directory(path: &Path) -> PeerResult<()> {
     Ok(())
 }
 
+/// Explicit unlock is required: a concurrent fork can retain a duplicated open
+/// description after the owner's File closes, even with CLOEXEC at exec time.
+struct WriterLock(File);
+impl Drop for WriterLock {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.0);
+    }
+}
+
 /// An explicitly created private queue. It has no project root or apply method.
 pub struct Inbox {
     root: PathBuf,
     db: Connection,
-    _writer: File,
+    // Fields drop in declaration order: close/checkpoint SQLite before unlock.
+    _writer: WriterLock,
 }
 impl std::fmt::Debug for Inbox {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -268,6 +278,7 @@ impl Inbox {
         writer
             .try_lock_exclusive()
             .map_err(|_| PeerError("Another local peer queue writer is active."))?;
+        let writer = WriterLock(writer);
         let db = sql(Connection::open(root.join("queue.sqlite3")))?;
         sql(db.busy_timeout(Duration::from_millis(200)))?;
         let application_id: u32 = sql(db.query_row("PRAGMA application_id", [], |r| r.get(0)))?;
@@ -633,6 +644,95 @@ mod tests {
             assert_eq!(inbox.accept(&b, &frame).unwrap().pending_count, 1);
         }
         assert_eq!(inbox.pending_count().unwrap(), 2);
+    }
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "subprocess helper invoked only by the inherited-descriptor regression"]
+    fn inherited_writer_child() {
+        if std::env::var_os("DEVDROP_INHERITED_WRITER_CHILD").is_some() {
+            // FD0 is the deliberately inherited writer description, not a pipe.
+            // Keep it alive independently of reads; the parent kills/waits us.
+            println!("DEVDROP_INHERITED_CHILD_READY");
+            std::io::Write::flush(&mut std::io::stdout()).unwrap();
+            std::thread::sleep(Duration::from_secs(10));
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn inherited_writer_description_does_not_extend_owner_lock() {
+        use std::process::{Child, Command, Stdio};
+        struct ChildGuard(Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let root = temp();
+        let path = fs::canonicalize(root.path()).unwrap().join("queue");
+        let mut inbox = Inbox::create_new(&path).unwrap();
+        let (a, b) = pair();
+        let proposal = Envelope::new(
+            &a,
+            1,
+            ZERO_DIGEST,
+            vec![put(b"generated inherited lock fixture")],
+        )
+        .unwrap();
+        let receipt = inbox.accept(&b, &proposal).unwrap();
+        let mut child = ChildGuard(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "store::tests::inherited_writer_child",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("DEVDROP_INHERITED_WRITER_CHILD", "1")
+                .stdin(Stdio::from(inbox._writer.0.try_clone().unwrap()))
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        // Wait for the actual ignored helper to execute before testing owner drop.
+        // This also catches an accidental omission of --ignored in the child args.
+        use std::io::BufRead;
+        let mut output = std::io::BufReader::new(child.0.stdout.take().unwrap());
+        let mut ready = false;
+        for _ in 0..8 {
+            let mut line = String::new();
+            if output.read_line(&mut line).unwrap() == 0 {
+                break;
+            }
+            if line.contains("DEVDROP_INHERITED_CHILD_READY") {
+                ready = true;
+                break;
+            }
+        }
+        assert!(
+            ready,
+            "The inherited-descriptor helper must signal readiness."
+        );
+        drop(inbox);
+        let reopened = Inbox::open(&path);
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "The inherited-description child must still be alive."
+        );
+        let reopened=reopened.expect("Owner drop must explicitly release its writer lock even while a child retains a duplicate description.");
+        assert_eq!(reopened.cursor(b.id()).unwrap(), (1, receipt.digest));
+        assert!(
+            Inbox::open(&path).is_err(),
+            "A genuine new writer must still be excluded."
+        );
+        drop(child);
+        assert!(
+            Inbox::open(&path).is_err(),
+            "Closing the old inherited descriptor must not unlock the new writer."
+        );
+        drop(reopened);
+        assert!(Inbox::open(&path).is_ok());
     }
     #[cfg(unix)]
     #[test]

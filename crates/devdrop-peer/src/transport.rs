@@ -243,6 +243,7 @@ mod tests {
         temp
     }
     fn queue(root: &Path) -> Arc<Mutex<Inbox>> {
+        let root = std::fs::canonicalize(root).unwrap();
         Arc::new(Mutex::new(Inbox::create_new(&root.join("queue")).unwrap()))
     }
     async fn start_server(pair: Paired, inbox: Arc<Mutex<Inbox>>) -> Arc<PeerServer> {

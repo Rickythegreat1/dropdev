@@ -133,11 +133,21 @@ pub struct Receipt {
     pub message: String,
 }
 
+/// Explicit unlock releases the owner's lock even if a concurrent fork retains
+/// a duplicate open description after the original File closes.
+struct WriterLock(File);
+impl Drop for WriterLock {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.0);
+    }
+}
+
 /// Single-writer lock covers SQLite and filesystem operations across CLI/Tauri/MCP.
 pub struct Engine {
     db: Connection,
     state: PathBuf,
-    _lock: File,
+    // Fields drop in declaration order: close SQLite before releasing its writer.
+    _lock: WriterLock,
 }
 impl Engine {
     pub fn open(state: &Path) -> Result<Self> {
@@ -194,6 +204,7 @@ impl Engine {
             .open(state.join("writer.lock")))?;
         lock.try_lock_exclusive()
             .map_err(|_| err("Another DevDrop operation is running. Wait for its receipt."))?;
+        let lock = WriterLock(lock);
         let db = sql(Connection::open(state.join("metadata.sqlite3")))?;
         sql(db.busy_timeout(Duration::from_secs(5)))?;
         sql(db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;
@@ -2143,6 +2154,101 @@ mod tests {
         fs::write(w.state.join("objects").join(hash(b"alpha")), b"corrupt").unwrap();
         assert!(e.apply(&plan.id, &plan.id, true, true).is_err());
         assert!(!w.target.join("a").exists());
+    }
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "Subprocess fixture invoked only by the inherited-writer regression."]
+    fn inherited_writer_child() {
+        if std::env::var_os("DEVDROP_CORE_INHERITED_WRITER_CHILD").is_some() {
+            // FD0 intentionally retains the parent's locked open description.
+            // The regression's ChildGuard always kills and waits for this child.
+            println!("DEVDROP_INHERITED_CHILD_READY");
+            std::io::Write::flush(&mut std::io::stdout()).unwrap();
+            std::thread::sleep(Duration::from_secs(10));
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn inherited_writer_description_does_not_extend_owner_lock() {
+        use std::process::{Child, Command, Stdio};
+        struct ChildGuard(Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let w = Workspace::new();
+        w.source("a", b"generated inherited writer fixture");
+        let owner = w.engine();
+        let pair = w.register(&owner);
+        let plan = owner.preview(&pair.id).unwrap();
+        assert_eq!(
+            Engine::open(&w.state).err().unwrap().0,
+            "Another DevDrop operation is running. Wait for its receipt."
+        );
+        let mut child = ChildGuard(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "local::tests::inherited_writer_child",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("DEVDROP_CORE_INHERITED_WRITER_CHILD", "1")
+                .stdin(Stdio::from(owner._lock.0.try_clone().unwrap()))
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        // Wait for the actual ignored helper to execute before testing owner drop.
+        // This also catches an accidental omission of --ignored in the child args.
+        use std::io::BufRead;
+        let mut output = std::io::BufReader::new(child.0.stdout.take().unwrap());
+        let mut ready = false;
+        for _ in 0..8 {
+            let mut line = String::new();
+            if output.read_line(&mut line).unwrap() == 0 {
+                break;
+            }
+            if line.contains("DEVDROP_INHERITED_CHILD_READY") {
+                ready = true;
+                break;
+            }
+        }
+        assert!(
+            ready,
+            "The inherited-descriptor helper must signal readiness."
+        );
+        drop(owner);
+        let reopened = Engine::open(&w.state);
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "The inherited-description child must still be alive."
+        );
+        let reopened = reopened.expect("Owner drop must release its lock even while a child retains the duplicate description.");
+        assert_eq!(reopened.pairs().unwrap()[0].id, pair.id);
+        assert!(reopened
+            .plans()
+            .unwrap()
+            .iter()
+            .any(|saved| saved.id == plan.id));
+        assert_eq!(
+            Engine::open(&w.state).err().unwrap().0,
+            "Another DevDrop operation is running. Wait for its receipt."
+        );
+        drop(child);
+        assert_eq!(
+            Engine::open(&w.state).err().unwrap().0,
+            "Another DevDrop operation is running. Wait for its receipt."
+        );
+        drop(reopened);
+        assert!(Engine::open(&w.state).is_ok());
+        assert!(
+            !w.target.join("a").exists(),
+            "Writer cleanup must not apply a planned workspace change."
+        );
     }
     #[test]
     fn secrets_generated_gitignore_never_enter_objects_output_or_events() {

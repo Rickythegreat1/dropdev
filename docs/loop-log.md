@@ -426,3 +426,33 @@ State paths now reject special files before open and use nonblocking/no-follow
 handles, with a generated FIFO regression. Formatting, all-target checking,
 scoped Clippy and optimized workspace builds passed after these corrections.
 Native platform results remain pending until the exact-source CI run is terminal.
+
+### Corrective platform pass after fd27f53
+
+Native CI at `fd27f535db47deb23460c4ce1d7106cc94682a6c` passed Windows tests,
+authenticated localhost acceptance and packaging, but Linux/macOS exposed false
+writer-busy errors immediately after owner drop. macOS additionally exposed raw
+`/var` aliases in generated fixture paths. No all-green handoff was published.
+
+A deterministic generated child holding a duplicate writer descriptor reproduced
+the false-busy error before the correction. Both peer queue and Core Engine now
+use an explicit-unlock RAII guard declared after SQLite, so the database closes
+before the owner's lock is released. It is wrapped immediately after acquisition,
+including constructor-error cleanup. Genuine active writers still exclude a new
+writer. No lock retry or weakened refusal was introduced. macOS test helpers now
+canonicalize only generated roots; production symlink/reparse refusal stays.
+
+Both inherited-descriptor regressions invoke their intentionally ignored child
+helpers explicitly with `--ignored`, wait for a flushed readiness marker, and use
+RAII kill/wait cleanup. They prove durable metadata survives owner drop while a
+child is still alive, and closing the old child cannot unlock a new writer.
+Peer/Core focused regressions passed; final full checks and new exact-source CI
+must pass before updating the same handoff. The two ignored entries are subprocess
+utilities exercised through their parent regressions, not omitted product tests.
+
+Final corrective local run passed **144 workspace tests**, with the two subprocess
+helpers intentionally ignored by the ordinary runner and exercised by their
+parent regressions. Peer all-target tests, the prior three simulator tests,
+14 authenticated localhost acceptance checks, all-target compilation, scoped
+Clippy, formatting and optimized builds passed. Exact native rerun remains the
+release gate; earlier fd27f53 failures are preserved as a corrected checkpoint.

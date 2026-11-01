@@ -2,8 +2,10 @@
 
 Status: static review, independent Linux TLS/library tests, and the generated
 localhost Engine acceptance passed. This is a real authenticated TCP/TLS
-prototype, not production device synchronization. Direct cross-VM TLS and native
-Windows/macOS acceptance have not been verified by this review.
+prototype, not production device synchronization. Direct cross-VM TLS has not
+been verified. The parent reports Windows native acceptance passed; this
+review's independent executions remain Linux-only. Corrected Linux/macOS CI is
+pending at this review checkpoint.
 
 ## Scope and trust
 
@@ -87,13 +89,46 @@ payload to local code. Expiry/revocation does not erase previously queued
 recovery evidence. The queue has no project-root parameter or apply method.
 It is OS-permission-protected SQLite storage; no at-rest encryption is claimed.
 
-## Final state-path and dependency corrections
+## State-path, writer lifecycle, and dependency corrections
 
-The root-owned correction adds a Unix generated-FIFO regression after this
-review's original 18-test library run. The resulting library test count is 19 on
-Unix and 18 on Windows. The correction was reviewed statically; final-source
-full-suite execution is owned by the parent task and was not duplicated here.
-No interface or workspace-mutation authority was added.
+The root-owned state-path correction adds a Unix generated-FIFO regression after
+this review's original 18-test library run. The parent reports native CI at
+`fd27f53` exposed two post-drop reopen failures on Linux and macOS, while the
+Windows peer suite and localhost example passed. The root reproduced the cause:
+closing the owner's lock file alone does not release a Unix flock while a child
+retains the same open file description. This was a queue-lock lifecycle failure,
+not a mutual-TLS authentication failure.
+
+The correction wraps the lock immediately after successful acquisition in a
+`WriterLock` guard whose destructor explicitly unlocks it. `Inbox` declares its
+SQLite connection before that guard, so SQLite closes/checkpoints before lock
+release. Failed initialization also drops the database before the guard. Active
+writer refusal remains immediate; no retry or wait hides a retained lock.
+
+The deterministic Unix regression passes a cloned writer description as a child
+test process's stdin. It reopens and verifies the durable cursor while the child
+is alive, checks a genuine second writer is still refused, kills/waits the child
+through a cleanup guard, and verifies closing the old child cannot unlock the
+new writer. The parent's red/green logs show the precise false-busy failure
+before the fix and a pass after it; this review independently reran the focused
+test successfully before helper-only test selection changed. The helper is now
+ignored during ordinary suite execution; its parent regression must pass
+`--ignored` when selecting it. The resulting peer library
+defines 20 real tests plus one ignored subprocess helper on Unix, and 18 tests
+on Windows. The parent owns the corrected full-suite and native-CI runs; they
+were not duplicated here.
+
+The related Core Engine raw-file-lock follow-up is closed in source. Its
+matching guard wraps immediately after acquisition and follows the SQLite
+connection in field order. The new Core regression also verifies that reopening
+retains registered pairs/plans and does not apply a planned target change. The
+parent reports 54 Core unit tests passed with one ignored subprocess helper;
+this review verified the code and did not independently rerun that full suite.
+
+macOS test fixtures now canonicalize generated temporary roots before calling
+the production API, accommodating `/var` resolving through `/private/var`.
+Production symlink refusal was not relaxed. No interface or workspace-mutation
+authority was added by these corrections.
 
 The workspace now requires Tokio `1.54.1`, outside the published AsyncFd
 I/O-safety affected range and the separate `1.54.0` Interval issue.
@@ -139,6 +174,9 @@ sender process-kill recovery is not implemented.
 - `cargo run -p devdrop-peer --example localhost --locked`: **14 acceptance
   checks passed**, reporting one Linux machine/process and real IPv4-loopback
   TCP with mutual TLS 1.3.
+- `cargo test -p devdrop-peer --lib
+  inherited_writer_description_does_not_extend_owner_lock --locked`: **1 passed,
+  0 failed, 20 filtered**, independently rerun after the lifecycle correction.
 
 The tests cover approved transfer, mandatory client authentication, unpaired
 clients, exact pins on both endpoints, disabled early-data/session mechanisms,
