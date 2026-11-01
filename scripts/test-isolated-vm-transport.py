@@ -7,6 +7,7 @@ import importlib.util
 import os
 from pathlib import Path
 import socket
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -44,7 +45,7 @@ class TransportSafety(unittest.TestCase):
         for action in ('mount -t', 'ip addr', 'kill -KILL', 'reboot -f'):
             self.assertLess(guard, init.index(action))
         self.assertIn('ulimit -c 0', init); self.assertIn('10.77.0.1', init); self.assertIn('10.77.0.2', init)
-        self.assertIn('"$address/30" dev eth0', init); self.assertIn("ip route show default", init)
+        self.assertIn('"$address/30" dev eth0', init); self.assertIn('/proc/net/route /proc/net/ipv6_route', init)
         self.assertIn('[ ! -e /etc/resolv.conf ]', init)
         self.assertIn('DEVDROP_VM_FIXTURE=1 /bin/vm_peer "$role"', init)
         self.assertIn('devdrop-isolated-vm-fixture-v1\\n', init)
@@ -167,6 +168,43 @@ class TransportSafety(unittest.TestCase):
             self.assertGreater(guest.diagnostic()['console_bytes'], 0)
         finally: guest.close(); a.close(); b.close()
 
+    def test_kernel_route_guard_accepts_only_connected_ipv4_and_ipv6_reject_sentinels(self):
+        value = self.route_fixture(self.connected4(), self.reject6() * 2)
+        self.assertEqual(value.returncode, 0)
+        self.assertEqual(__import__('json').loads(value.stdout), dict(ipv4_connected_routes=1, ipv4_default_routes=0, ipv6_default_routes=0, ipv6_reject_sentinels=2))
+        # UP+REJECT still cannot route traffic; classify separately, never count
+        # the kernel sentinel as an external usable default gateway.
+        self.assertEqual(self.route_fixture(self.connected4(), self.reject6().replace('00200200', '00200201')).returncode, 0)
+
+    def test_kernel_route_guard_refuses_actual_default_gateway_foreign_net_and_malformed_rows(self):
+        valid = self.connected4()
+        forbidden = [valid.replace('00004D0A', '00000000').replace('FCFFFFFF', '00000000'),
+                     valid.replace('00004D0A', '00004E0A'),
+                     valid.replace('00000000 0001', '02004D0A 0003'),
+                     valid.replace('eth0 ', 'eth1 '),
+                     valid + valid.split('\n')[1] + '\n',
+                     valid.split('\n')[0] + '\n']
+        for table in forbidden:
+            with self.subTest(table=table): self.assertEqual(self.route_fixture(table, self.reject6()).returncode, 42)
+        usable6 = self.reject6().replace('00200200', '00000003').replace(' lo\n', ' eth0\n')
+        self.assertEqual(self.route_fixture(valid, usable6).returncode, 42)
+        self.assertEqual(self.route_fixture(valid, 'not-a-kernel-route\n').returncode, 42)
+
+    @staticmethod
+    def connected4():
+        return 'Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT\neth0 00004D0A 00000000 0001 0 0 0 FCFFFFFF 0 0 0\n'
+
+    @staticmethod
+    def reject6():
+        return '00000000000000000000000000000000 00 00000000000000000000000000000000 00 00000000000000000000000000000000 ffffffff 00000001 00000000 00200200 lo\n'
+
+    @staticmethod
+    def route_fixture(ipv4, ipv6):
+        with tempfile.TemporaryDirectory() as root:
+            v4 = Path(root) / 'generated-route4'; v4.write_text(ipv4)
+            v6 = Path(root) / 'generated-route6'; v6.write_text(ipv6)
+            return subprocess.run(['awk', m.route_guard_program(), str(v4), str(v6)], capture_output=True, text=True, timeout=5)
+
     @contextlib.contextmanager
     def mocked_run(self, fail_status=False, fail_launch=False):
         """Exercise all orchestration with model guests, no VM/privileged tools."""
@@ -188,7 +226,7 @@ class TransportSafety(unittest.TestCase):
                 self.pid = 100 + self.generation
             def event(self, prefix):
                 if prefix == 'DEVDROP_VM_READY':
-                    return dict(guest='devdrop-' + self.role, kernel='5.15.0-fixture', boot_id_sha256=digest(self.role + 'boot' + str(self.boot)), address='10.77.0.' + ('1' if self.role == 'a' else '2') + '/30', interfaces=['eth0', 'lo'], default_routes=0, dns_configured=False)
+                    return dict(guest='devdrop-' + self.role, kernel='5.15.0-fixture', boot_id_sha256=digest(self.role + 'boot' + str(self.boot)), address='10.77.0.' + ('1' if self.role == 'a' else '2') + '/30', interfaces=['eth0', 'lo'], default_routes=0, dns_configured=False, routes=dict(ipv4_connected_routes=1, ipv4_default_routes=0, ipv6_default_routes=0, ipv6_reject_sentinels=2))
                 return dict(reply='offer', schema='devdrop-vm-worker/v1', pid=self.pid, offer=self.offer, scope=m.SCOPE)
             def supervisor(self, action, reply=True):
                 if action in ('nic_down', 'nic_up'):

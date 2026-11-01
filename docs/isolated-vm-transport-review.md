@@ -93,7 +93,7 @@ arbitrary future network labs.
   enabling the VM feature.
 - `cargo test -p devdrop-peer --features vm-fixture --example vm_peer --locked`:
   **2 passed**, covering strict control, boot gates, and bounded control reads.
-- `python3 -B scripts/test-isolated-vm-transport.py`: **14 passed**, covering
+- `python3 -B scripts/test-isolated-vm-transport.py`: **16 passed**, covering
   no-host-network QEMU arguments, guest-PID1 guard/fixed controls, archive paths,
   new regular 64 MiB disk formatting targets with formatter mocked, module
   dependency/path rules, runtime-library allowlist, control deadlines, and an
@@ -101,7 +101,8 @@ arbitrary future network labs.
   per-pair/global count separation, mid-scenario/second-launch cleanup, and
   exclusive sanitized report creation, and EOF classification from a real
   short-lived nonprivileged fixture child without printing its sentinel/raw
-  option-ROM name.
+  option-ROM name, plus exact kernel-route fixtures rejecting usable defaults
+  and foreign IPv4 routes.
 
 These checks did not boot guests, format a real disk, download packages, invoke
 sudo, bind private IPs, or execute guest networking. Model guests prove Python
@@ -130,6 +131,29 @@ well as written to the exclusive report. It exports no raw console, certificate
 offer, ROM filename, ciphertext, payload, or private key. Independent pure tests
 passed **14/14** after this delta. No privileged or VM/network command ran
 locally; retry within the existing exact approval is appropriate.
+
+## Kernel-route guard correction
+
+The parent reports the second actual attempt at `e165774` booted Linux but
+stopped at `guest_boot/default_route` before worker/transfer checks. Partial
+evidence reportedly shows zero completed checks, both QEMUs stopped, cable FDs
+closed, generated state removed, no cleanup errors, and 5.010 seconds of network
+lifetime. This review did not independently retrieve that evidence. The BusyBox
+route-selector explanation remains inferred; no TLS success is claimed.
+
+The narrow correction changes observation only. One shared AWK program reads
+the kernel IPv4/IPv6 route tables, requiring exactly one UP `eth0` connected
+`10.77.0.0/30` route with zero gateway and rejecting other IPv4 routes/defaults.
+Usable UP/non-REJECT IPv6 defaults are refused, while nonforwarding reject
+sentinels are counted separately. Boot evidence now contains those actual
+counts. No interface/address/route, host-network, or approval scope is changed.
+
+Independent pure tests passed **16/16** after the correction, including actual
+AWK execution over generated connected/default/foreign/malformed/duplicate and
+reject-sentinel fixtures. A separate missing-IPv6-table probe failed closed.
+No privileged or guest-network command ran locally. Retrying the exact approved
+lab is appropriate; actual worker/TLS/queue/fault/reboot acceptance remains
+unverified pending CI.
 
 ## Exact approved boundary
 

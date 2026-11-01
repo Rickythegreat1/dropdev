@@ -584,3 +584,15 @@ partial evidence after cleanup. Fourteen pure driver tests pass, including a
 short-lived nonprivileged stdout child that proves diagnostics classify the
 failure without exporting raw console or sentinel data. No host/network scope
 or security protection changed, and no user files were accessed.
+
+Second actual transport checkpoint `e165774` reached Linux guest init but refused
+the route guard (`guest_boot`, `default_route`) before pairing/transfer. Its
+sanitized partial evidence confirms both QEMUs stopped, cable FDs closed, private
+generated state removed, no cleanup errors and 5.010 seconds of network lifetime.
+The BusyBox prefix selector was ambiguous; its exact original behavior was not
+proven. The correction reads kernel route tables directly: require exactly the
+eth0 connected `10.77.0.0/30` route, zero IPv4 gateway and no usable IPv4/IPv6
+default; classify IPv6 reject sentinels separately. The same awk parser runs in
+guest and pure fixtures. Sixteen safety/model tests pass; independent review
+found no critical issue. This strengthens validation without changing routes,
+addresses, kernel/host settings or the approved network scope.

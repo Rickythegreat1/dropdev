@@ -122,6 +122,43 @@ def worker_runtime(worker):
     return files
 
 
+def route_guard_program():
+    """One awk parser shared by guest execution and unprivileged table fixtures."""
+    return '''
+function fail() { invalid=1 }
+function hex(s, n,i,c,v) {
+ if (length(s)<1 || length(s)>8 || s !~ /^[0-9A-Fa-f]+$/) { fail(); return 0 }
+ n=0
+ for(i=1;i<=length(s);i++) { c=tolower(substr(s,i,1)); v=index("0123456789abcdef",c)-1; n=n*16+v }
+ return n
+}
+function address(s) { return length(s)==32 && s ~ /^[0-9A-Fa-f]+$/ }
+FILENAME==ARGV[1] {
+ if(FNR==1) { if($1!="Iface" || $2!="Destination" || $3!="Gateway" || $8!="Mask") fail(); header++; next }
+ if(NF!=11) { fail(); next }
+ if($2=="00000000" && $8=="00000000") defaults4++
+ if($1=="eth0" && toupper($2)=="00004D0A" && $3=="00000000" && toupper($8)=="FCFFFFFF" && hex($4)==1) connected++
+ else fail()
+ next
+}
+FILENAME==ARGV[2] {
+ if(NF!=10 || !address($1) || !address($3) || !address($5) || ($10!="lo" && $10!="eth0")) { fail(); next }
+ flags=hex($9); prefix=hex($2)
+ if(prefix>128) fail()
+ if($1=="00000000000000000000000000000000" && prefix==0) {
+  up=int(flags/1)%2; rejected=int(flags/512)%2
+  if(rejected) sentinels++
+  else if(up) defaults6++
+ }
+ next
+}
+END {
+ if(invalid || header!=1 || connected!=1 || defaults4!=0 || defaults6!=0 || sentinels>8) exit 42
+ printf "{\\"ipv4_connected_routes\\":%d,\\"ipv4_default_routes\\":%d,\\"ipv6_default_routes\\":%d,\\"ipv6_reject_sentinels\\":%d}",connected,defaults4,defaults6,sentinels
+}
+'''
+
+
 def guest_init(modules):
     loads = '\n'.join('insmod /modules/' + path.name + ' || fatal module_load' for path in modules)
     return ('''#!/bin/sh
@@ -153,10 +190,10 @@ fi
 ip link set lo up || fatal loopback
 ip addr add "$address/30" dev eth0 || fatal address
 ip link set eth0 up || fatal link
-[ -z "$(ip route show default)" ] || fatal default_route
+route_summary=$(awk 'REPLACE_ROUTE_GUARD' /proc/net/route /proc/net/ipv6_route) || fatal route_guard
 [ ! -e /etc/resolv.conf ] || fatal resolver
 boot=$(sha256sum /proc/sys/kernel/random/boot_id | cut -d' ' -f1)
-printf 'DEVDROP_VM_READY {"guest":"%s","kernel":"%s","boot_id_sha256":"%s","address":"%s/30","interfaces":["eth0","lo"],"default_routes":0,"dns_configured":false}\\n' "$devdrop_guest" "$(uname -r)" "$boot" "$address"
+printf 'DEVDROP_VM_READY {"guest":"%s","kernel":"%s","boot_id_sha256":"%s","address":"%s/30","interfaces":["eth0","lo"],"default_routes":0,"dns_configured":false,"routes":%s}\\n' "$devdrop_guest" "$(uname -r)" "$boot" "$address" "$route_summary"
 mkfifo -m 0600 /run/worker.in /run/worker.out || fatal fifo
 exec 3<>/run/worker.in
 exec 4<>/run/worker.out
@@ -182,7 +219,7 @@ while IFS= read -r control; do
  esac
 done
 poweroff -f
-''').encode('ascii')
+''').replace('REPLACE_ROUTE_GUARD', route_guard_program()).encode('ascii')
 
 
 def archive(entries):
@@ -274,7 +311,7 @@ class Guest:
                         self.events.append((tag, record))
                 if line.startswith(b'DEVDROP_GUEST_FATAL '):
                     stage = line.split(b' ', 1)[1].strip().decode('ascii')
-                    require(stage in ('proc_mount', 'sys_mount', 'dev_mount', 'console_mode', 'run_mount', 'role', 'module_load', 'disk_missing', 'fixture_mount', 'marker', 'fixture_dir', 'interfaces', 'loopback', 'address', 'link', 'default_route', 'resolver', 'fifo', 'link_down', 'link_up', 'no_worker', 'worker_kill'), 'Unrecognized guest failure stage')
+                    require(stage in ('proc_mount', 'sys_mount', 'dev_mount', 'console_mode', 'run_mount', 'role', 'module_load', 'disk_missing', 'fixture_mount', 'marker', 'fixture_dir', 'interfaces', 'loopback', 'address', 'link', 'route_guard', 'resolver', 'fifo', 'link_down', 'link_up', 'no_worker', 'worker_kill'), 'Unrecognized guest failure stage')
                     raise RuntimeError('Guest fixed stage failed: ' + stage)
             if self.selector.select(min(.2, max(0, end - time.monotonic()))):
                 chunk = os.read(self.proc.stdout.fileno(), 65536)
@@ -513,9 +550,11 @@ def write_report(output, result):
 
 
 def validate_boot(value, role, kernel):
-    require(set(value) == {'guest', 'kernel', 'boot_id_sha256', 'address', 'interfaces', 'default_routes', 'dns_configured'}, 'Unexpected guest boot report fields')
+    require(set(value) == {'guest', 'kernel', 'boot_id_sha256', 'address', 'interfaces', 'default_routes', 'dns_configured', 'routes'}, 'Unexpected guest boot report fields')
     require(value['guest'] == 'devdrop-' + role and value['kernel'] == kernel and HEX.fullmatch(value['boot_id_sha256']) is not None, 'Guest independent kernel metadata invalid')
     require(value['address'] == ('10.77.0.1/30' if role == 'a' else '10.77.0.2/30') and value['interfaces'] == ['eth0', 'lo'] and value['default_routes'] == 0 and value['dns_configured'] is False, 'Guest network differs from approved isolated cable')
+    routes = value['routes']
+    require(set(routes) == {'ipv4_connected_routes', 'ipv4_default_routes', 'ipv6_default_routes', 'ipv6_reject_sentinels'} and routes['ipv4_connected_routes'] == 1 and routes['ipv4_default_routes'] == 0 and routes['ipv6_default_routes'] == 0 and type(routes['ipv6_reject_sentinels']) is int and 0 <= routes['ipv6_reject_sentinels'] <= 8, 'Guest kernel route table differs from approved isolated cable')
     return value
 
 
