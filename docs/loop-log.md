@@ -501,3 +501,10 @@ parent regressions. Peer all-target tests, the prior three simulator tests,
 14 authenticated localhost acceptance checks, all-target compilation, scoped
 Clippy, formatting and optimized builds passed. Exact native rerun remains the
 release gate; earlier fd27f53 failures are preserved as a corrected checkpoint.
+
+The diagnostic run at `736ea30` again timed out, now proving only 141 console
+bytes and no Linux boot milestone. Inspection found extracted QEMU had an
+explicit BIOS path but lacked its task-local option-ROM data search path. The
+next change adds `-L` for the extracted official QEMU data and requires its Linux
+loader ROM; the no-NIC command safety test now verifies that path. This changes
+package asset resolution only, with no host installation or isolation change.

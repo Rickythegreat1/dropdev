@@ -4,10 +4,11 @@ from unittest.mock import patch
 spec=importlib.util.spec_from_file_location('vm_readiness',Path(__file__).with_name('isolated-vm-readiness.py'));m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
 class ReadinessSafety(unittest.TestCase):
  def test_guest_command_has_no_nic_monitor_display_or_host_share(self):
-  args=m.qemu_args('/fixture/qemu','/fixture/bios','/fixture/kernel','/fixture/initrd','devdrop-a')
+  args=m.qemu_args('/fixture/qemu','/fixture/bios','/fixture/kernel','/fixture/initrd','devdrop-a','/fixture/qemu-data')
   self.assertEqual(args[args.index('-nic')+1],'none');self.assertEqual(args[args.index('-monitor')+1],'none');self.assertEqual(args[args.index('-display')+1],'none')
+  self.assertEqual(args[args.index('-L')+1],'/fixture/qemu-data')
   self.assertNotIn('-netdev',args);self.assertNotIn('-virtfs',args);self.assertNotIn('-drive',args);self.assertIn('tcg,thread=multi',args)
-  with self.assertRaises(RuntimeError):m.qemu_args('q','b','k','i','unknown -nic user')
+  with self.assertRaises(RuntimeError):m.qemu_args('q','b','k','i','unknown -nic user','data')
  def test_cpio_contains_only_fixed_guest_fixture_and_no_network_setup(self):
   with tempfile.TemporaryDirectory() as root:
    p=Path(root)/'known-busybox';p.write_bytes(b'generated binary placeholder');data=gzip.decompress(m.cpio_image(p));names=[];offset=0;init=None

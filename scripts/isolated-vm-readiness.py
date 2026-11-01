@@ -96,9 +96,9 @@ def elf_interpreter(path):
             return loader
     raise RuntimeError('Expected standard dynamic QEMU loader')
 
-def qemu_args(binary,firmware,kernel,initrd,name):
+def qemu_args(binary,firmware,kernel,initrd,name,data_dir):
     require(name in ('devdrop-a','devdrop-b'),'Unknown generated guest identity')
-    return [str(binary),'-name',name,'-machine','pc,dump-guest-core=off,mem-merge=off','-accel','tcg,thread=multi','-cpu','max','-smp','1','-m','512','-nodefaults','-no-user-config','-display','none','-monitor','none','-serial','stdio','-nic','none','-bios',str(firmware),'-kernel',str(kernel),'-initrd',str(initrd),'-append',f'console=ttyS0 rdinit=/init panic=0 devdrop_guest={name}']
+    return [str(binary),'-name',name,'-machine','pc,dump-guest-core=off,mem-merge=off','-accel','tcg,thread=multi','-cpu','max','-smp','1','-m','512','-nodefaults','-no-user-config','-display','none','-monitor','none','-serial','stdio','-nic','none','-L',str(data_dir),'-bios',str(firmware),'-kernel',str(kernel),'-initrd',str(initrd),'-append',f'console=ttyS0 rdinit=/init panic=0 devdrop_guest={name}']
 
 class Guest:
     def __init__(self,args,environment):
@@ -117,7 +117,7 @@ class Guest:
                 line,self.buffer=self.buffer.split(b'\n',1)
                 # Only fixed diagnostic categories leave this blank guest. No
                 # raw console, memory addresses, environment or guest data.
-                for signature in (b'Linux version',b'Kernel panic',b'Failed to execute /init',b'Run /init',b'Unpacking initramfs',b'Initramfs unpacking failed',b'No working init found',b'Unable to mount root',b'Waiting for root device',b'random: crng init done'):
+                for signature in (b'Could not load option rom',b'could not load PC BIOS',b'Linux version',b'Kernel panic',b'Failed to execute /init',b'Run /init',b'Unpacking initramfs',b'Initramfs unpacking failed',b'No working init found',b'Unable to mount root',b'Waiting for root device',b'random: crng init done'):
                     label=signature.decode('ascii')
                     if signature in line and label not in self.boot_signatures:self.boot_signatures.append(label)
                 if b'DEVDROP_VM_READY ' in line:
@@ -183,6 +183,7 @@ def run(output):
         initrd=root/'initrd.cpio.gz';initrd.write_bytes(cpio_image(busybox))
         binary=tools/'usr/bin/qemu-system-x86_64';require(binary.is_file(),'Extracted official QEMU binary missing')
         bios=tools/'usr/share/seabios/bios-256k.bin';require(bios.is_file(),'Extracted official BIOS missing')
+        data_dir=tools/'usr/share/qemu';require((data_dir/'linuxboot_dma.bin').is_file(),'Official QEMU kernel loader ROM missing')
         environment=os.environ.copy()
         # Task-local libraries only; inherited proxies/CA/security configuration stay intact.
         paths=[tools/'usr/lib/x86_64-linux-gnu',tools/'lib/x86_64-linux-gnu',tools/'usr/lib',tools/'lib']
@@ -191,7 +192,7 @@ def run(output):
         version=command(prefix+[str(binary),'--version'],environment=environment,timeout=10,limit=4096)
         guests=[]
         try:
-            for name in ('devdrop-a','devdrop-b'):guests.append(Guest(prefix+qemu_args(binary,bios,kernels[0],initrd,name),environment))
+            for name in ('devdrop-a','devdrop-b'):guests.append(Guest(prefix+qemu_args(binary,bios,kernels[0],initrd,name,data_dir),environment))
             first=[guest.ready() for guest in guests]
             require(first[0]['guest']=='devdrop-a' and first[1]['guest']=='devdrop-b' and first[0]['boot_id_sha256']!=first[1]['boot_id_sha256'],'Independent guest identities did not verify')
             receiver_pid=guests[1].proc.pid;guests[1].send('reboot');reboot=guests[1].ready()
