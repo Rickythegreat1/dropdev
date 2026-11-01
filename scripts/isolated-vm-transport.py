@@ -227,7 +227,9 @@ def qemu_args(binary, bios, kernel, initrd, role, data_dir, disk, cable_fd):
     require(',' not in str(disk) and Path(disk).suffix == '.img', 'Unsafe generated disk argument')
     base = readiness.qemu_args(binary, bios, kernel, initrd, 'devdrop-' + role, data_dir)
     at = base.index('-nic'); del base[at:at + 2]
-    base += ['-netdev', f'socket,id=lab,fd={cable_fd}', '-device', 'virtio-net-pci,netdev=lab,mac=52:54:00:77:00:0' + ('1' if role == 'a' else '2'),
+    # Direct -kernel boot needs no PXE expansion ROM. QEMU6.2 otherwise requests
+    # efi-virtio.rom from an optional package absent in download-only setup.
+    base += ['-netdev', f'socket,id=lab,fd={cable_fd}', '-device', 'virtio-net-pci,netdev=lab,romfile=,mac=52:54:00:77:00:0' + ('1' if role == 'a' else '2'),
              '-drive', f'file={disk},format=raw,if=none,id=fixture,cache=none', '-device', 'virtio-blk-pci,drive=fixture']
     base[base.index('-append') + 1] += ' devdrop_vm_fixture=1 oops=panic'
     return base
@@ -244,7 +246,10 @@ class Guest:
             self.proc.kill(); self.proc.wait(timeout=8)
             self.proc.stdin.close(); self.proc.stdout.close()
             raise
-        self.buffer = b''; self.total = 0; self.deadline = deadline; self.events = []; self.milestones = []
+        self.buffer = b''; self.total = 0; self.deadline = deadline; self.events = []; self.milestones = []; self.qemu_categories = []
+
+    def diagnostic(self):
+        return dict(console_bytes=self.total, boot_milestones=self.milestones, qemu_categories=self.qemu_categories, returncode=self.proc.poll())
 
     def event(self, prefix, timeout=120):
         end = min(self.deadline, time.monotonic() + timeout)
@@ -256,6 +261,12 @@ class Guest:
                 require(len(line) <= 65536, 'Guest line exceeds bounded control budget')
                 for milestone in (b'Linux version', b'Run /init', b'Kernel panic', b'Could not load option rom', b'Initramfs unpacking failed'):
                     if milestone in line and milestone.decode() not in self.milestones: self.milestones.append(milestone.decode())
+                for category, patterns in (
+                    ('missing_guest_option_rom', (b'failed to find romfile', b'Could not open option rom', b'Could not load option rom')),
+                    ('invalid_inherited_socket', (b'not a socket', b'Bad file descriptor', b'could not open socket')),
+                    ('guest_device_unavailable', (b'not a valid device model name', b'failed to initialize', b'Could not open backing file')),
+                ):
+                    if any(pattern in line for pattern in patterns) and category not in self.qemu_categories: self.qemu_categories.append(category)
                 for tag in ('DEVDROP_VM_READY', 'DEVDROP_WORKER', 'DEVDROP_SUPERVISOR'):
                     marker = (tag + ' ').encode()
                     if line.startswith(marker):
@@ -265,11 +276,13 @@ class Guest:
                     stage = line.split(b' ', 1)[1].strip().decode('ascii')
                     require(stage in ('proc_mount', 'sys_mount', 'dev_mount', 'console_mode', 'run_mount', 'role', 'module_load', 'disk_missing', 'fixture_mount', 'marker', 'fixture_dir', 'interfaces', 'loopback', 'address', 'link', 'default_route', 'resolver', 'fifo', 'link_down', 'link_up', 'no_worker', 'worker_kill'), 'Unrecognized guest failure stage')
                     raise RuntimeError('Guest fixed stage failed: ' + stage)
-            require(self.proc.poll() is None, 'Owned guest exited before expected bounded response')
             if self.selector.select(min(.2, max(0, end - time.monotonic()))):
-                chunk = os.read(self.proc.stdout.fileno(), 65536); require(bool(chunk), 'Owned guest console closed')
+                chunk = os.read(self.proc.stdout.fileno(), 65536)
+                require(bool(chunk), 'Owned guest console closed; diagnostics=' + json.dumps(self.diagnostic(), sort_keys=True))
                 self.total += len(chunk); require(self.total <= 4 * 1024 * 1024, 'Guest console exceeds metadata budget')
                 self.buffer += chunk
+            elif self.proc.poll() is not None:
+                raise RuntimeError('Owned guest exited; diagnostics=' + json.dumps(self.diagnostic(), sort_keys=True))
         stage = {'DEVDROP_VM_READY': 'boot_modules_disk_network', 'DEVDROP_WORKER': 'worker_protocol', 'DEVDROP_SUPERVISOR': 'fixed_supervisor'}[prefix]
         raise RuntimeError('Bounded guest response deadline exceeded; stage=' + stage + '; console_bytes=' + str(self.total) + '; boot_milestones=' + json.dumps(self.milestones))
 
@@ -360,7 +373,7 @@ def run(output, worker):
                   transport='tls13-mutual-certificate-pin', listener='10.77.0.2:37431', admitted_sender='10.77.0.1', prefix_length=30,
                   default_routes=0, dns_configured=False, public_listener=False, host_network_changes=False,
                   production_transport=False, fixture_only=True, proposal_only=True, file_apply=False,
-                  persistent_credentials=False, checks=[], identities=[], cleanup_errors=[])
+                  persistent_credentials=False, checks=[], identities=[], cleanup_errors=[], phase='official_tooling_setup')
     scratch_path = None; network_start = None; guests = []; cables = []
     def check(name, condition):
         require(condition, 'Fixture assertion failed: ' + name)
@@ -390,6 +403,7 @@ def run(output, worker):
             try:
                 cables = list(socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM))
                 require(all(s.family == socket.AF_UNIX and s.type == socket.SOCK_STREAM for s in cables), 'Only a Unix socketpair cable is approved')
+                result['phase'] = 'qemu_launch'
                 for i, role in enumerate(('a', 'b')):
                     info = disks[i].lstat()
                     require(disks[i].parent == scratch_path and stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and info.st_size == 64 * 1024 * 1024, 'Generated regular disk changed before guest launch')
@@ -399,12 +413,15 @@ def run(output, worker):
                 # parent's copies prevents an invisible extra cable owner.
                 for cable in cables: cable.close()
                 a, b = guests
+                result['phase'] = 'guest_boot'
                 boots = [validate_boot(g.event('DEVDROP_VM_READY'), role, result['guest_kernel']) for g, role in zip(guests, ('a', 'b'))]
                 result['initial_boots'] = boots
                 check('two_actual_guest_kernels_independent_boot_ids', boots[0]['boot_id_sha256'] != boots[1]['boot_id_sha256'])
+                result['phase'] = 'worker_startup'
                 offers = [worker_offer(g.event('DEVDROP_WORKER'), role, 'initial', result) for g, role in zip(guests, ('a', 'b'))]
                 check('initial_generated_queues_empty_no_workspace', status(a)['pending'] == 0 and status(b)['pending'] == 0)
                 check('unpaired_send_refused_before_transport', a.worker(dict(command='send')) == dict(reply='failure', failure_class='invalid_control_or_state'))
+                result['phase'] = 'initial_pairing_transfer'
                 pairing = pair(a, b, *offers)
                 check('explicit_both_end_fingerprint_pairing', HEX.fullmatch(pairing) is not None)
                 listen(b)
@@ -417,6 +434,7 @@ def run(output, worker):
                 check('actual_cross_guest_mutual_tls_proposal_queued', status(b)['pending'] == 1)
                 sent, served = exchange(a, b, 'retry'); valid_receipt(sent, served, pairing, 'duplicate', 1)
                 check('exact_retry_idempotent_single_durable_proposal', status(b)['pending'] == 1)
+                result['phase'] = 'nic_interruption'
                 down = b.supervisor('nic_down')
                 require(down == dict(reply='nic_down', worker_pid=offers[1]['pid'], boot_id_sha256=boots[1]['boot_id_sha256'], operstate='down'), 'NIC down did not verify same worker/kernel')
                 sent, served = exchange(a, b, 'retry')
@@ -426,6 +444,7 @@ def run(output, worker):
                 sent, served = exchange(a, b, 'retry'); valid_receipt(sent, served, pairing, 'duplicate', 1)
                 check('nic_up_recovers_same_pairing_exact_duplicate', status(b)['pending'] == 1)
                 result['nic_cycle'] = [down, up]
+                result['phase'] = 'worker_hard_kill_recovery'
                 restart(b)
                 b2 = worker_offer(b.event('DEVDROP_WORKER'), 'b', 'after_hard_kill', result)
                 check('hard_kill_restart_keeps_queue_loses_ram_identity', b2['offer']['fingerprint'] != offers[1]['offer']['fingerprint'] and status(b)['pending'] == 1 and not status(b)['paired'])
@@ -441,6 +460,7 @@ def run(output, worker):
                 pair2 = pair(a, b, a2, b3); require(pair2 != pairing, 'Fresh RAM pairing unexpectedly reused old grant')
                 listen(b); sent, served = exchange(a, b, 'send'); valid_receipt(sent, served, pair2, 'queued', 1)
                 check('fresh_explicit_pairing_after_process_restart_queues_new_proposal', status(b)['pending'] == 2)
+                result['phase'] = 'guest_kernel_reboot_recovery'
                 old_emulator_pid = b.proc.pid
                 b.supervisor('reboot', reply=False)
                 reboot = validate_boot(b.event('DEVDROP_VM_READY'), 'b', result['guest_kernel'])
@@ -455,6 +475,7 @@ def run(output, worker):
                 check('all_transfers_remain_private_proposals_no_file_apply', status(a)['workspace_absent'] and status(b)['workspace_absent'])
                 result.update(receiver_reboot=reboot, queue_counts=dict(after_initial=1, after_process_restart=2, after_kernel_reboot_before_repair=2, after_kernel_reboot_repair=3))
             finally:
+                result['guest_diagnostics_before_cleanup'] = [guest.diagnostic() for guest in guests]
                 for guest in guests:
                     try: guest.close()
                     except Exception: result['cleanup_errors'].append('owned_qemu_stop_wait_failed')
@@ -470,11 +491,13 @@ def run(output, worker):
         check('owned_qemus_stopped_and_cable_descriptors_closed', result['owned_qemus_stopped'] and result['cable_fds_closed'])
         check('host_installed_package_state_unchanged', sha('/var/lib/dpkg/status') == status_before)
         result['success'] = True
-    except BaseException:
+    except BaseException as error:
         result['success'] = False
+        result['failure_kind'] = type(error).__name__
         result['generated_private_state_removed'] = scratch_path is None or not scratch_path.exists()
         if network_start is not None: result['network_lifetime_seconds'] = round(time.monotonic() - network_start, 3)
         write_report(output, result)
+        print('ISOLATED_VM_TRANSPORT_PARTIAL_EVIDENCE=' + json.dumps(result, sort_keys=True))
         raise
     result['generated_private_state_removed'] = not scratch_path.exists()
     write_report(output, result)

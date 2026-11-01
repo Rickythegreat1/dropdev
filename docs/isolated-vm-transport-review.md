@@ -4,7 +4,9 @@ Status: feature, worker, scenario, and workflow reviewed statically; independent
 pure/model tests passed. No critical outstanding issue was found in the exact
 approved fixture scope. Proceeding to its fresh hosted CI is appropriate. Actual
 guest TLS, NIC interruption, worker restart, kernel reboot recovery, and cleanup
-have not yet been executed by this review and remain CI-pending.
+have not yet been executed by this review. The first actual hosted run failed
+at startup; a narrowly corrected retry remains pending, with no transfer success
+claimed.
 
 ## Reviewed adapter and worker
 
@@ -91,19 +93,43 @@ arbitrary future network labs.
   enabling the VM feature.
 - `cargo test -p devdrop-peer --features vm-fixture --example vm_peer --locked`:
   **2 passed**, covering strict control, boot gates, and bounded control reads.
-- `python3 -B scripts/test-isolated-vm-transport.py`: **13 passed**, covering
+- `python3 -B scripts/test-isolated-vm-transport.py`: **14 passed**, covering
   no-host-network QEMU arguments, guest-PID1 guard/fixed controls, archive paths,
   new regular 64 MiB disk formatting targets with formatter mocked, module
   dependency/path rules, runtime-library allowlist, control deadlines, and an
   ordinary local AF_UNIX socketpair, the complete modeled scenario with
   per-pair/global count separation, mid-scenario/second-launch cleanup, and
-  exclusive sanitized report creation.
+  exclusive sanitized report creation, and EOF classification from a real
+  short-lived nonprivileged fixture child without printing its sentinel/raw
+  option-ROM name.
 
 These checks did not boot guests, format a real disk, download packages, invoke
 sudo, bind private IPs, or execute guest networking. Model guests prove Python
 orchestration/contract checks only; they are not substitute VM/TLS evidence.
 The earlier process-localhost, artifact-relay, and no-NIC readiness runs remain
 separate tests and do not establish the new scenario's unrun assertions.
+
+## First hosted attempt and narrow startup correction
+
+The parent reports source `a81e192`, run `41271160679`, job `124744049603`, failed
+with `Owned guest console closed` at guest startup; partial artifact
+`13069396466` exists. This review did not retrieve that artifact. No authenticated
+transfer, interruption, or reboot-recovery success follows from that failure.
+
+The reviewed correction sets `romfile=` only on the fixed virtio network device.
+Direct kernel boot does not use its PXE option ROM; the extracted Linux boot
+loader/BIOS paths remain required. The proposed missing optional ROM explanation
+for the first failure is an inference, pending runtime confirmation. No endpoint,
+address, disk, guest-network capability, host policy, or package-install scope
+was expanded.
+
+EOF handling now drains available console bytes and retains only fixed QEMU
+failure categories, fixed boot milestones, return code, byte counts, and a
+fixed scenario phase. Sanitized partial evidence is printed after cleanup as
+well as written to the exclusive report. It exports no raw console, certificate
+offer, ROM filename, ciphertext, payload, or private key. Independent pure tests
+passed **14/14** after this delta. No privileged or VM/network command ran
+locally; retry within the existing exact approval is appropriate.
 
 ## Exact approved boundary
 

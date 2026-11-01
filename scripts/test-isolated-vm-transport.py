@@ -7,6 +7,7 @@ import importlib.util
 import os
 from pathlib import Path
 import socket
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -31,6 +32,7 @@ class TransportSafety(unittest.TestCase):
         for forbidden in ('listen=', 'connect=', 'tap', 'bridge', 'hostfwd', 'guestfwd', 'virtfs', 'share=', 'if=ide'):
             self.assertNotIn(forbidden, text)
         self.assertIn('dump-guest-core=off', text); self.assertIn('devdrop_vm_fixture=1', text)
+        self.assertIn('virtio-net-pci,netdev=lab,romfile=,mac=52:54:00:77:00:01', args)
         self.assertIn('format=raw,if=none,id=fixture,cache=none', text)
         for role, fd in [('c', 17), ('a', 2)]:
             with self.assertRaises(RuntimeError): m.qemu_args('q', 'b', 'k', 'i', role, 'd', '/fixture/a.img', fd)
@@ -156,6 +158,15 @@ class TransportSafety(unittest.TestCase):
             m.write_report(output, {'success': True})
             with self.assertRaises(FileExistsError): m.write_report(output, {'success': False})
 
+    def test_eof_captures_only_fixed_qemu_category_not_raw_console(self):
+        a, b = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        guest = m.Guest([sys.executable, '-c', 'print(\'qemu: failed to find romfile "efi-virtio.rom" PRIVATE_SENTINEL\')'], {'PATH': '/usr/bin:/bin'}, a.fileno(), m.time.monotonic() + 5)
+        try:
+            with self.assertRaisesRegex(RuntimeError, 'missing_guest_option_rom') as failure: guest.event('DEVDROP_VM_READY', timeout=3)
+            self.assertNotIn('PRIVATE_SENTINEL', str(failure.exception)); self.assertNotIn('efi-virtio.rom', str(failure.exception))
+            self.assertGreater(guest.diagnostic()['console_bytes'], 0)
+        finally: guest.close(); a.close(); b.close()
+
     @contextlib.contextmanager
     def mocked_run(self, fail_status=False, fail_launch=False):
         """Exercise all orchestration with model guests, no VM/privileged tools."""
@@ -214,6 +225,7 @@ class TransportSafety(unittest.TestCase):
                     receiver.last = dict(ok=True, receipt=receipt, failure_class=None)
                 return dict(reply='sent', **receiver.last)
             def close(self): self.closed = True; self.proc.closed = True
+            def diagnostic(self): return dict(console_bytes=0, boot_milestones=[], qemu_categories=[], returncode=self.proc.poll())
         actual_pair = socket.socketpair
         def socketpair(*args):
             result = actual_pair(*args); cables.extend(result); return result

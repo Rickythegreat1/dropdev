@@ -571,3 +571,16 @@ passed with only the two previously documented core style categories allowed.
 Independent review found no critical outstanding issue, and corrected per-pair
 versus total queue receipt checks and specific old-pin failure evidence. Actual
 guest networking remains unrun until the explicit opt-in CI commit executes.
+
+First actual transport CI checkpoint `a81e192` failed with `Owned guest console
+closed` after policy/safety/worker-build gates passed. Its partial artifact is
+preserved in run `41271160679`; supported local byte transfer was unavailable,
+so no cleanup-duration or transfer success is inferred from that artifact here.
+Inspection of QEMU 6.2 source confirms virtio-net defaults an external PXE ROM.
+The direct-kernel fixture now sets empty `romfile=` for that unused NIC boot ROM;
+the original failure cause remains inferred because its console was not kept.
+The retry retains fixed EOF/exit/phase categories, byte counts and sanitized
+partial evidence after cleanup. Fourteen pure driver tests pass, including a
+short-lived nonprivileged stdout child that proves diagnostics classify the
+failure without exporting raw console or sentinel data. No host/network scope
+or security protection changed, and no user files were accessed.
