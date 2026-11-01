@@ -75,6 +75,72 @@ jobs:
           path: ${{ runner.temp }}/devdrop-authenticated-localhost.json
           if-no-files-found: error
           retention-days: 7
+      - name: Exercise separate-process localhost faults
+        run: cargo run -p devdrop-peer --example process_localhost --locked > "${RUNNER_TEMP}/devdrop-process-localhost.json"
+      - name: Validate and log bounded separate-process evidence
+        run: |
+          python3 - <<'PY'
+          import json, os, re
+          from pathlib import Path
+          path = Path(os.environ['RUNNER_TEMP']) / 'devdrop-process-localhost.json'
+          assert path.is_file() and not path.is_symlink() and 0 < path.stat().st_size <= 65536
+          with path.open('rb') as stream:
+              encoded = stream.read(65537)
+          assert len(encoded) <= 65536
+          report = json.loads(encoded)
+          assert report['schema'] == 'devdrop-process-localhost-evidence/v1'
+          topology = report['topology']
+          assert topology == {'machines': 1, 'minimum_concurrent_processes': 3, 'peer_processes_spawned': 5, 'address_spaces': 'separate-child-processes'}
+          assert report['cross_device'] is False and report['process_kill'] is True
+          assert report['vm_reboot'] is False and report['physical_network_outage'] is False
+          assert report['transport'] == 'loopback-tls13-mtls'
+          runtime = report['runtime']
+          assert runtime['os'] == 'linux' and runtime['arch'] == 'x86_64'
+          assert type(runtime['coordinator_pid']) is int and runtime['coordinator_pid'] > 0
+          identities = []
+          expected = {('sender', 'initial'), ('receiver', 'initial'), ('receiver', 'after_first_kill'), ('sender', 'after_kill'), ('receiver', 'after_second_kill')}
+          assert len(report['identities']) == 5
+          for identity in report['identities']:
+              assert (identity['role'], identity['stage']) in expected
+              assert type(identity['pid']) is int and identity['pid'] > 0 and identity['pid'] != runtime['coordinator_pid']
+              assert re.fullmatch(r'[0-9a-f]{64}', identity['fingerprint'])
+              identities.append({key: identity[key] for key in ('role', 'stage', 'pid', 'fingerprint')})
+          assert {(identity['role'], identity['stage']) for identity in identities} == expected
+          assert len({identity['fingerprint'] for identity in identities}) == 5
+          assert len({identity['pid'] for identity in identities if identity['stage'] == 'initial'}) == 2
+          expected_cases = {'encrypted_record_bitflip', 'mid_tls_flight_cut', 'post_commit_ack_drop', 'transparent_exact_retry'}
+          proxy = []
+          assert len(report['proxy']) == 4
+          for item in report['proxy']:
+              assert item['case'] in expected_cases
+              for key in ('c2s_bytes', 's2c_bytes', 'c2s_encrypted_records'):
+                  assert type(item[key]) is int and 0 <= item[key] <= 1048576
+              assert item['c2s_encrypted_records'] > 0
+              assert item['fault_fired'] is (item['case'] != 'transparent_exact_retry')
+              proxy.append({key: item[key] for key in ('case', 'c2s_bytes', 's2c_bytes', 'c2s_encrypted_records', 'fault_fired')})
+          assert {item['case'] for item in proxy} == expected_cases
+          assert report['queue_counts'] == {'after_lost_ack_retry': 1, 'after_explicit_new_pairing': 2}
+          assert len(report['checks']) == 12
+          checks = []
+          for check in report['checks']:
+              assert re.fullmatch(r'[a-z0-9_]{1,128}', check['name']) and check['passed'] is True
+              checks.append({'name': check['name'], 'passed': True})
+          assert len({check['name'] for check in checks}) == 12
+          summary = {'schema': report['schema'], 'topology': topology,
+                     'cross_device': False, 'process_kill': True, 'vm_reboot': False,
+                     'physical_network_outage': False, 'transport': report['transport'],
+                     'runtime': {key: runtime[key] for key in ('os', 'arch', 'coordinator_pid')},
+                     'identities': identities, 'proxy': proxy, 'checks': checks,
+                     'queue_counts': report['queue_counts']}
+          print('PROCESS_LOCALHOST_EVIDENCE=' + json.dumps(summary, sort_keys=True))
+          PY
+      - name: Save sanitized separate-process localhost evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: devdrop-process-localhost-evidence
+          path: ${{ runner.temp }}/devdrop-process-localhost.json
+          if-no-files-found: error
+          retention-days: 7
 
   desktop:
     name: Desktop workflow tests and web build
@@ -119,3 +185,33 @@ jobs:
     permissions:
       contents: read
     uses: ./.github/workflows/release.yml
+
+  linux_runtime:
+    name: Disposable Linux package install, GUI startup, and uninstall
+    needs: packages
+    if: github.event_name == 'push' && github.event.repository.private == false
+    runs-on: ubuntu-22.04
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Test package smoke safety guards
+        run: python3 -B scripts/test_smoke_linux_package.py
+      - name: Download this run's generated Linux package artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: devdrop-Linux-X64
+          path: ${{ runner.temp }}/linux-package
+      - name: Install, observe isolated GUI, and uninstall own package
+        run: python3 -B scripts/smoke-linux-package.py --artifact-dir "${RUNNER_TEMP}/linux-package" --report "${RUNNER_TEMP}/devdrop-linux-runtime.json"
+      - name: Save sanitized disposable Linux runtime evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: devdrop-linux-runtime-evidence
+          path: ${{ runner.temp }}/devdrop-linux-runtime.json
+          if-no-files-found: error
+          retention-days: 7

@@ -1,0 +1,30 @@
+name: Network-disabled VM readiness
+on:
+  push:
+    branches: ["codex/**"]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: isolated-vm-readiness-${{ github.sha }}
+  cancel-in-progress: true
+jobs:
+  no_nic_guests:
+    if: github.event.repository.private == false
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Boot and reboot generated guests without network interfaces
+        env:
+          DEVDROP_PUBLIC_REPOSITORY: ${{ github.event.repository.private == false }}
+        run: python3 scripts/isolated-vm-readiness.py --output "${RUNNER_TEMP}/devdrop-nicless-vm-readiness.json"
+      - name: Preserve sanitized readiness evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: devdrop-nicless-vm-readiness
+          path: ${{ runner.temp }}/devdrop-nicless-vm-readiness.json
+          if-no-files-found: error
+          retention-days: 7

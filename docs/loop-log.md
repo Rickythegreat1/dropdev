@@ -427,6 +427,44 @@ handles, with a generated FIFO regression. Formatting, all-target checking,
 scoped Clippy and optimized workspace builds passed after these corrections.
 Native platform results remain pending until the exact-source CI run is terminal.
 
+## 2026-11-01 — Process faults, installed Linux runtime and isolated VM readiness
+
+1. **Task and scope.** Continue the v5 testing request from `9308532`, concentrating
+   on independent peer processes, actual connection faults, installed-package
+   startup and available VM capability. Direct cross-machine TLS remains an
+   acceptance goal, conditional on specific private-network approval. Do not
+   reinterpret artifact relay, localhost or NIC-less boot as cross-device TLS.
+2. **Touched files.** Add `crates/devdrop-peer/examples/process_localhost.rs`,
+   `scripts/smoke-linux-package.py` and its safety tests, download-only
+   `scripts/isolated-vm-readiness.py` and its safety tests, the separate readiness
+   workflow, ordinary/release workflow checks, `docs/peer-test-plan.md` and
+   `docs/peer-fault-test-review.md`. No production transport bind policy or
+   filesystem mutation API is broadened.
+3. **Risk.** High for test-harness process/network/privileged installer cleanup;
+   blocked for nonloopback listeners and guest networking until scoped approval.
+   Use only generated fixtures, RAM-only test keys, bounded pipes and public
+   disposable CI VMs. Never disable the WebKit sandbox, change firewall settings,
+   persist device credentials, touch user projects or retry the denied PR.
+4. **Tests and evaluation.** Run full existing Rust/UI checks plus process hard
+   kills, lost acknowledgments, encrypted TLS record damage, stream cuts, stale
+   pairing, durable queue reopen and exact retry. Run pure installer/refusal tests
+   locally and install/window/IPC/remove only in fresh hosted Linux CI. Separately
+   test two TCG Linux guests with zero NICs and a real guest kernel reboot; this
+   does not test peer persistence across VM reboot. Preserve exact CI evidence.
+5. **UX and truthfulness.** No product UI change. Evidence must label one OS with
+   multiple processes, connection interruption, two guest kernels and real guest
+   reboot separately. No network approval or successful install/runtime claim is
+   inferred from preparation or static tests. Keep disposable-copy and incomplete
+   ACL/ownership/xattr restrictions visible in the existing handoff.
+6. **Closeout.** Independent safety review passed; local validation passed 144 workspace tests,
+   18 UI tests, two process example tests plus its invoked helper, 12 standalone
+   process fault checks, 11 installer safety tests and five readiness safety
+   tests. Formatting, typechecking, all-target checking and scoped Clippy passed;
+   final exact-source platform, fresh installed-runtime and NIC-less guest runs
+   must reach terminal results before the same Library handoff is replaced.
+   Report failures and never-run cross-device/VM-state tests separately, with
+   exact action-time prerequisites and no duplicate Sites project or PR retry.
+
 ### Corrective platform pass after fd27f53
 
 Native CI at `fd27f535db47deb23460c4ce1d7106cc94682a6c` passed Windows tests,
