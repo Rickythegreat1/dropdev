@@ -3,7 +3,7 @@
 use crate::file_permissions::{self as access, AccessMetadata, FilePermissions};
 use cap_std::{ambient_authority, fs::Dir};
 use fs2::FileExt;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -124,7 +124,64 @@ pub struct Plan {
     pub target_metadata: Option<MetadataSnapshot>,
     #[serde(default)]
     pub applied_metadata: BTreeMap<String, AccessMetadata>,
+    #[serde(default)]
+    pub received: Option<ReceivedContext>,
 }
+
+/// Local review input only. Bytes never appear in plans, events or receipts.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ReceivedChange {
+    Put {
+        path: String,
+        hash: String,
+        bytes: Vec<u8>,
+        permissions: FilePermissions,
+    },
+    Delete {
+        path: String,
+        previous_hash: String,
+    },
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReceivedProposal {
+    pub pairing_id: String,
+    pub sequence: u64,
+    pub digest: String,
+    pub previous_digest: String,
+    pub changes: Vec<ReceivedChange>,
+}
+impl ReceivedProposal {
+    pub fn semantic_hash(&self) -> Result<String> {
+        Ok(hash(encode(self)?.as_bytes()))
+    }
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReceivedContext {
+    pub pairing_id: String,
+    pub sequence: u64,
+    pub digest: String,
+    pub previous_digest: String,
+    pub semantic_hash: String,
+    pub side: String,
+    pub paths: BTreeSet<String>,
+    pub hashes: Snapshot,
+    pub permissions: PermissionMap,
+    #[serde(default)]
+    pub resolutions: BTreeMap<String, String>,
+    #[serde(default)]
+    pub unresolvable_paths: BTreeSet<String>,
+}
+
+const ZERO_IMPORT_DIGEST: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+fn valid_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+type ImportHead = (String, String, u64, String, Snapshot, PermissionMap);
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Receipt {
     pub plan_id: String,
@@ -209,19 +266,37 @@ impl Engine {
         sql(db.busy_timeout(Duration::from_secs(5)))?;
         sql(db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;
           CREATE TABLE IF NOT EXISTS schema_version(version INTEGER NOT NULL);
-          INSERT INTO schema_version SELECT 2 WHERE NOT EXISTS(SELECT 1 FROM schema_version);
+          INSERT INTO schema_version SELECT 3 WHERE NOT EXISTS(SELECT 1 FROM schema_version);
           CREATE TABLE IF NOT EXISTS pairs(id TEXT PRIMARY KEY, body TEXT NOT NULL, baseline TEXT NOT NULL, baseline_permissions TEXT NOT NULL DEFAULT '{}', revision INTEGER NOT NULL DEFAULT 0);
           CREATE TABLE IF NOT EXISTS plans(id TEXT PRIMARY KEY, pair_id TEXT NOT NULL REFERENCES pairs(id), body TEXT NOT NULL);
           CREATE TABLE IF NOT EXISTS events(seq INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, pair_id TEXT, plan_id TEXT, body TEXT NOT NULL);
         "))?;
-        let version: i64 =
+        let mut version: i64 =
             sql(db.query_row("SELECT version FROM schema_version", [], |r| r.get(0)))?;
         if version == 1 {
             sql(db.execute_batch("BEGIN IMMEDIATE; ALTER TABLE pairs ADD COLUMN baseline_permissions TEXT NOT NULL DEFAULT '{}'; UPDATE schema_version SET version=2; COMMIT;"))?;
-        } else if version != 2 {
+            version = 2;
+        }
+        if !matches!(version, 2 | 3) {
             return Err(err(
                 "Unsupported local metadata schema; upgrade DevDrop without deleting state.",
             ));
+        }
+        const RECEIVED_SCHEMA:&str="CREATE TABLE IF NOT EXISTS received_heads(origin TEXT PRIMARY KEY, pair_id TEXT NOT NULL REFERENCES pairs(id), side TEXT NOT NULL, sequence INTEGER NOT NULL, digest TEXT NOT NULL, hashes TEXT NOT NULL, permissions TEXT NOT NULL); CREATE TABLE IF NOT EXISTS received_attempts(origin TEXT NOT NULL REFERENCES received_heads(origin), sequence INTEGER NOT NULL, digest TEXT NOT NULL, semantic_hash TEXT NOT NULL, plan_id TEXT NOT NULL REFERENCES plans(id), PRIMARY KEY(origin,sequence));";
+        if version == 2 {
+            sql(db.execute_batch("BEGIN IMMEDIATE"))?;
+            if db
+                .execute_batch(RECEIVED_SCHEMA)
+                .and_then(|_| db.execute_batch("UPDATE schema_version SET version=3; COMMIT"))
+                .is_err()
+            {
+                let _ = db.execute_batch("ROLLBACK");
+                return Err(err(
+                    "Received import schema migration failed; preserve local metadata.",
+                ));
+            }
+        } else {
+            sql(db.execute_batch(RECEIVED_SCHEMA))?;
         }
         io(fs::create_dir_all(state.join("objects")))?;
         access::inspect_directory(&directory_file(&io(state_dir.open_dir("objects"))?)?)
@@ -345,6 +420,53 @@ impl Engine {
                 .query_row("SELECT body FROM plans WHERE id=?1", [id], |r| r.get(0)))?;
         decode(&body)
     }
+    pub fn get_plan(&self, id: &str) -> Result<Plan> {
+        self.plan(id)
+    }
+    fn import_head(&self, origin: &str) -> Result<Option<ImportHead>> {
+        let row: Option<(String,String,u64,String,String,String)> = sql(self.db.query_row(
+            "SELECT pair_id,side,sequence,digest,hashes,permissions FROM received_heads WHERE origin=?1",
+            [origin], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)),
+        ).optional())?;
+        row.map(|(pair, side, sequence, digest, hashes, modes)| {
+            Ok((
+                pair,
+                side,
+                sequence,
+                digest,
+                decode(&hashes)?,
+                decode(&modes)?,
+            ))
+        })
+        .transpose()
+    }
+    fn check_import_head(
+        &self,
+        pair_id: &str,
+        context: &ReceivedContext,
+    ) -> Result<(Snapshot, PermissionMap)> {
+        if let Some((pair, side, sequence, digest, hashes, modes)) =
+            self.import_head(&context.pairing_id)?
+        {
+            if pair != pair_id || side != context.side {
+                return Err(err(
+                    "Received origin is already bound to another local project or side.",
+                ));
+            }
+            if sequence.checked_add(1) != Some(context.sequence)
+                || digest != context.previous_digest
+            {
+                return Err(err("Received proposal sequence or predecessor differs from the verified import head."));
+            }
+            Ok((hashes, modes))
+        } else if context.sequence == 1 && context.previous_digest == ZERO_IMPORT_DIGEST {
+            Ok((Snapshot::new(), PermissionMap::new()))
+        } else {
+            Err(err(
+                "The first received import must have sequence one and a zero predecessor.",
+            ))
+        }
+    }
     fn save_plan(&self, p: &Plan) -> Result<()> {
         sql(self.db.execute("INSERT INTO plans(id,pair_id,body) VALUES(?1,?2,?3) ON CONFLICT(id) DO UPDATE SET body=excluded.body",params![p.id,p.pair_id,encode(p)?]))?;
         Ok(())
@@ -465,7 +587,281 @@ impl Engine {
         };
         self.new_plan(&p, ops, s, t, revision, None, blockers)
     }
+    /// Import only reviewed explicit paths. There is no sparse source root and
+    /// no remote entry point; a local caller must confirm the exact wire digest.
+    pub fn preview_received(
+        &self,
+        pair_id: &str,
+        side: &str,
+        proposal: ReceivedProposal,
+        confirmed_digest: &str,
+        disposable_copies: bool,
+    ) -> Result<Plan> {
+        if !disposable_copies {
+            return Err(err(BETA_WARNING));
+        }
+        if confirmed_digest != proposal.digest
+            || !valid_digest(&proposal.digest)
+            || !valid_digest(&proposal.pairing_id)
+            || !valid_digest(&proposal.previous_digest)
+            || proposal.sequence == 0
+            || proposal.sequence > i64::MAX as u64
+            || !matches!(side, "source" | "target")
+            || proposal.changes.is_empty()
+            || proposal.changes.len() > 32
+        {
+            return Err(err("Review the exact received digest, bounded changes and local destination before previewing."));
+        }
+        self.ensure_no_recovery(pair_id)?;
+        let (p, _, _, revision) = self.pair(pair_id)?;
+        let mut context = ReceivedContext {
+            pairing_id: proposal.pairing_id.clone(),
+            sequence: proposal.sequence,
+            digest: proposal.digest.clone(),
+            previous_digest: proposal.previous_digest.clone(),
+            semantic_hash: String::new(),
+            side: side.into(),
+            paths: BTreeSet::new(),
+            hashes: Snapshot::new(),
+            permissions: PermissionMap::new(),
+            resolutions: BTreeMap::new(),
+            unresolvable_paths: BTreeSet::new(),
+        };
+        let mut folded = BTreeSet::new();
+        let mut total = 0usize;
+        for change in &proposal.changes {
+            let path = match change {
+                ReceivedChange::Put { path, .. } | ReceivedChange::Delete { path, .. } => path,
+            };
+            safe_path(path)?;
+            if !folded.insert(path.to_lowercase())
+                || excluded(Path::new(&p.source), path)?
+                || excluded(Path::new(&p.target), path)?
+            {
+                return Err(err(
+                    "Received paths are duplicated or excluded by local project policy.",
+                ));
+            }
+            context.paths.insert(path.clone());
+            match change {
+                ReceivedChange::Put {
+                    hash: expected,
+                    bytes,
+                    permissions,
+                    ..
+                } => {
+                    total = total.saturating_add(bytes.len());
+                    if total > 16 * 1024
+                        || !valid_digest(expected)
+                        || hash(bytes) != *expected
+                        || secret_content(bytes)
+                    {
+                        return Err(err("Received content exceeds limits or failed hash/non-secret validation. No received content was stored."));
+                    }
+                    match permissions {
+                        #[cfg(unix)]
+                        FilePermissions::Unix { mode } if *mode <= 0o777 => {}
+                        #[cfg(windows)]
+                        FilePermissions::Windows { .. } => {}
+                        _ => {
+                            return Err(err(
+                                "Received permissions are unsupported on this operating system.",
+                            ))
+                        }
+                    }
+                    context.hashes.insert(path.clone(), expected.clone());
+                    context
+                        .permissions
+                        .insert(path.clone(), permissions.clone());
+                }
+                ReceivedChange::Delete { previous_hash, .. } if !valid_digest(previous_hash) => {
+                    return Err(err("Received deletion requires an exact predecessor hash."))
+                }
+                _ => {}
+            }
+        }
+        // File/child aliases cannot be fulfilled by one exact operation set.
+        if context.paths.iter().any(|path| {
+            parent_paths(path)
+                .iter()
+                .any(|parent| folded.contains(&parent.to_lowercase()))
+        }) {
+            return Err(err("Received paths contain a file and its descendant."));
+        }
+        let mut names = BTreeMap::new();
+        for path in &context.paths {
+            for component in parent_paths(path)
+                .into_iter()
+                .chain(std::iter::once(path.clone()))
+            {
+                if names
+                    .insert(component.to_lowercase(), component.clone())
+                    .is_some_and(|previous| previous != component)
+                {
+                    return Err(err(
+                        "Received paths or ancestors have incompatible case aliases.",
+                    ));
+                }
+            }
+        }
+        context.semantic_hash = proposal.semantic_hash()?;
+        let previous:Option<(String,String,String)>=sql(self.db.query_row(
+            "SELECT digest,semantic_hash,plan_id FROM received_attempts WHERE origin=?1 AND sequence=?2",
+            params![context.pairing_id,context.sequence], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+        ).optional())?;
+        let mut previous_plan = None;
+        if let Some((digest, semantic, id)) = previous {
+            if digest != context.digest || semantic != context.semantic_hash {
+                return Err(err("Altered same-sequence received proposal was refused."));
+            }
+            let old = self.plan(&id)?;
+            if old.pair_id != pair_id
+                || old.received.as_ref().map(|c| c.side.as_str()) != Some(side)
+            {
+                return Err(err(
+                    "Received origin cannot be remapped to another local destination.",
+                ));
+            }
+            if old.state == "verified"
+                || (old.state == "rolled_back"
+                    && self
+                        .import_head(&context.pairing_id)?
+                        .is_some_and(|head| head.2 >= context.sequence))
+            {
+                return Ok(old);
+            }
+            previous_plan = Some(old);
+        }
+        let (remote_hashes, remote_modes) = self.check_import_head(pair_id, &context)?;
+        let (s, t) = self.scans(&p)?;
+        let dirty_now = dirty_git(&p.source)? || dirty_git(&p.target)?;
+        if let Some(old) = previous_plan {
+            if old.state == "planned"
+                && old.base_revision == revision
+                && scan_from_plan(&old, "source")? == s
+                && scan_from_plan(&old, "target")? == t
+                && old
+                    .blockers
+                    .iter()
+                    .any(|blocker| blocker.starts_with("Git worktree"))
+                    == dirty_now
+            {
+                return Ok(old);
+            }
+        }
+        let local = if side == "source" { &s } else { &t };
+        let mut operations = vec![];
+        for change in &proposal.changes {
+            let path = match change {
+                ReceivedChange::Put { path, .. } | ReceivedChange::Delete { path, .. } => path,
+            };
+            if local.metadata.directories.contains_key(path)
+                || parent_paths(path)
+                    .iter()
+                    .any(|parent| local.contains_key(parent))
+            {
+                return Err(err("Received file intent collides with an existing local directory or parent file."));
+            }
+            for component in parent_paths(path)
+                .into_iter()
+                .chain(std::iter::once(path.clone()))
+            {
+                for existing in local.keys().chain(local.metadata.directories.keys()) {
+                    if existing.to_lowercase() == component.to_lowercase() && *existing != component
+                    {
+                        return Err(err("Received path or ancestor collides with an existing local path's case."));
+                    }
+                }
+            }
+            let before = local.get(path).cloned();
+            let before_mode = local.metadata.files.get(path).map(|m| &m.permissions);
+            let after = context.hashes.get(path).cloned();
+            let after_mode = context.permissions.get(path).cloned();
+            let expected = remote_hashes.get(path);
+            let predecessor_ok = match change {
+                ReceivedChange::Put { .. } => {
+                    (before.as_ref() == expected && before_mode == remote_modes.get(path))
+                        || (before == after && before_mode == after_mode.as_ref())
+                }
+                ReceivedChange::Delete { previous_hash, .. } => {
+                    if expected != Some(previous_hash) {
+                        context.unresolvable_paths.insert(path.clone());
+                    }
+                    expected == Some(previous_hash)
+                        && before.as_ref() == Some(previous_hash)
+                        && before_mode == remote_modes.get(path)
+                }
+            };
+            if predecessor_ok && before == after && before_mode == after_mode.as_ref() {
+                continue;
+            }
+            operations.push(operation(
+                path.clone(),
+                if predecessor_ok {
+                    kind(&before, &after)
+                } else {
+                    "conflict"
+                },
+                side,
+                before,
+                after,
+                after_mode,
+                None,
+            ));
+        }
+        // All checks precede storing any received bytes. Plans/events contain
+        // only content identifiers and supported metadata, never the payload.
+        if context.unresolvable_paths.is_empty() {
+            for change in &proposal.changes {
+                if let ReceivedChange::Put { bytes, .. } = change {
+                    self.store(bytes)?;
+                }
+            }
+        }
+        let mut blockers = if dirty_now {
+            vec![
+                "Git worktree has uncommitted changes; preserve local work before applying.".into(),
+            ]
+        } else {
+            vec![]
+        };
+        if !context.unresolvable_paths.is_empty() {
+            blockers.push("Received deletion predecessor is not verified import history; this intent cannot be resolved or applied.".into());
+        }
+        self.new_plan_received(
+            &p,
+            operations,
+            s,
+            t,
+            revision,
+            None,
+            blockers,
+            Some(context),
+        )
+    }
     fn new_plan(
+        &self,
+        p: &Pair,
+        operations: Vec<Operation>,
+        source_scan: ScanData,
+        target_scan: ScanData,
+        base_revision: i64,
+        reverses: Option<String>,
+        blockers: Vec<String>,
+    ) -> Result<Plan> {
+        self.new_plan_received(
+            p,
+            operations,
+            source_scan,
+            target_scan,
+            base_revision,
+            reverses,
+            blockers,
+            None,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn new_plan_received(
         &self,
         p: &Pair,
         mut operations: Vec<Operation>,
@@ -474,6 +870,7 @@ impl Engine {
         base_revision: i64,
         reverses: Option<String>,
         blockers: Vec<String>,
+        received: Option<ReceivedContext>,
     ) -> Result<Plan> {
         for op in &mut operations {
             let (local, incoming) = if op.side == "source" {
@@ -532,7 +929,8 @@ impl Engine {
                     &source_scan,
                     &target_scan,
                     base_revision,
-                    &reverses
+                    &reverses,
+                    &received
                 ))?
                 .as_bytes()
             )[..32]
@@ -548,21 +946,144 @@ impl Engine {
             target_scan: target_scan.hashes,
             source_metadata: Some(source_scan.metadata),
             target_metadata: Some(target_scan.metadata),
-            metadata_version: 1,
+            metadata_version: if received.is_some() { 2 } else { 1 },
             applied_metadata: BTreeMap::new(),
             base_revision,
             reverses,
+            received,
         };
         self.transaction(|| {
             self.save_plan(&plan)?;
+            if let Some(context)=&plan.received {
+                if plan.reverses.is_none() {
+                    self.check_import_head(&p.id,context)?;
+                    sql(self.db.execute("INSERT OR IGNORE INTO received_heads VALUES(?1,?2,?3,0,?4,'{}','{}')",params![context.pairing_id,p.id,context.side,ZERO_IMPORT_DIGEST]))?;
+                    let old:Option<String>=sql(self.db.query_row("SELECT plan_id FROM received_attempts WHERE origin=?1 AND sequence=?2",params![context.pairing_id,context.sequence],|r|r.get(0)).optional())?;
+                    if let Some(old)=old { let mut old=self.plan(&old)?; if old.state=="planned" {old.state="stale".into(); self.save_plan(&old)?;} }
+                    sql(self.db.execute("INSERT INTO received_attempts VALUES(?1,?2,?3,?4,?5) ON CONFLICT(origin,sequence) DO UPDATE SET plan_id=excluded.plan_id",params![context.pairing_id,context.sequence,context.digest,context.semantic_hash,plan.id]))?;
+                }
+            }
             self.event("preview", &p.id, &plan.id, json!({"plan":plan}))?;
             Ok(())
         })?;
         Ok(plan)
     }
     /// Explicit resolution stores and retains both versions in CAS before any write.
+    pub fn resolve_received_preview(&self, id: &str, path: &str, choice: &str) -> Result<Plan> {
+        safe_path(path)?;
+        let original = self.plan(id)?;
+        let mut context = original
+            .received
+            .clone()
+            .ok_or_else(|| err("Select an immutable received preview for this resolution."))?;
+        if context.unresolvable_paths.contains(path) {
+            return Err(err(
+                "Received deletion has no matching verified predecessor and cannot be resolved.",
+            ));
+        }
+        if original.reverses.is_some() || original.state != "planned" {
+            return Err(err(
+                "Only a current planned received preview can be resolved.",
+            ));
+        }
+        self.ensure_no_recovery(&original.pair_id)?;
+        self.check_import_head(&original.pair_id, &context)?;
+        let (p, _, _, revision) = self.pair(&original.pair_id)?;
+        let (s, t) = self.scans(&p)?;
+        if revision != original.base_revision
+            || s != scan_from_plan(&original, "source")?
+            || t != scan_from_plan(&original, "target")?
+        {
+            return Err(err(
+                "Received preview is stale; review and preview the received proposal again.",
+            ));
+        }
+        let index = original
+            .operations
+            .iter()
+            .position(|o| o.path == path && o.kind == "conflict")
+            .ok_or_else(|| err("Selected received path is not a conflict."))?;
+        let conflict = &original.operations[index];
+        let mut operations = original.operations.clone();
+        operations.remove(index);
+        match choice {
+            "incoming" => operations.push(Operation {
+                kind: kind(&conflict.before, &conflict.after).into(),
+                ..conflict.clone()
+            }),
+            "local" => {}
+            "both" => {
+                let before = conflict
+                    .before
+                    .as_ref()
+                    .ok_or_else(|| err("Keep both requires content on both sides."))?;
+                if conflict.after.is_none() {
+                    return Err(err("Keep both requires content on both sides."));
+                }
+                let sibling = format!("{path}.devdrop-conflict-{}", &before[..12]);
+                safe_path(&sibling)?;
+                if excluded(Path::new(&p.source), &sibling)?
+                    || excluded(Path::new(&p.target), &sibling)?
+                    || context
+                        .paths
+                        .iter()
+                        .chain(s.keys())
+                        .chain(t.keys())
+                        .chain(s.metadata.directories.keys())
+                        .chain(t.metadata.directories.keys())
+                        .any(|p| {
+                            p.to_lowercase() == sibling.to_lowercase()
+                                || p.to_lowercase()
+                                    .starts_with(&format!("{}/", sibling.to_lowercase()))
+                        })
+                {
+                    return Err(err("Conflict preservation path collides with local or selected work; preserve it locally and preview again."));
+                }
+                operations.push(operation(
+                    sibling,
+                    "copy",
+                    &context.side,
+                    None,
+                    Some(before.clone()),
+                    conflict.permissions_before.clone(),
+                    None,
+                ));
+                operations.push(Operation {
+                    kind: kind(&conflict.before, &conflict.after).into(),
+                    ..conflict.clone()
+                });
+            }
+            _ => {
+                return Err(err(
+                    "Choose incoming, local, or both for a received resolution preview.",
+                ))
+            }
+        }
+        context.resolutions.insert(path.into(), choice.into());
+        self.new_plan_received(
+            &p,
+            operations,
+            s,
+            t,
+            revision,
+            None,
+            original.blockers,
+            Some(context),
+        )
+    }
+    /// Ordinary local pair resolution. Received previews use their own exact scope.
     pub fn resolve_preview(&self, pair_id: &str, path: &str, choice: &str) -> Result<Plan> {
         safe_path(path)?;
+        if self.plans()?.iter().any(|plan| {
+            plan.pair_id == pair_id
+                && plan.state == "planned"
+                && plan
+                    .received
+                    .as_ref()
+                    .is_some_and(|context| context.paths.contains(path))
+        }) {
+            return Err(err("Use the received-proposal workflow and its exact preview ID to resolve this conflict."));
+        }
         let current = self.preview(pair_id)?;
         let conflict = current
             .operations
@@ -686,8 +1207,10 @@ impl Engine {
         interrupt_after: Option<usize>,
     ) -> Result<Receipt> {
         let mut plan = self.plan(id)?;
-        if plan.metadata_version != 1
-            || plan.source_metadata.is_none()
+        if !matches!(
+            (plan.metadata_version, plan.received.is_some()),
+            (1, false) | (2, true)
+        ) || plan.source_metadata.is_none()
             || plan.target_metadata.is_none()
         {
             return Err(err("Legacy byte-only plans cannot be applied or rolled back. Preserve retained files and create a new permission-aware preview."));
@@ -723,7 +1246,32 @@ impl Engine {
         if plan.reverses.is_none() {
             self.ensure_no_recovery(&plan.pair_id)?;
         }
-        let (p, _, _, revision) = self.pair(&plan.pair_id)?;
+        let (p, old_baseline, old_permissions, revision) = self.pair(&plan.pair_id)?;
+        if let Some(context) = &plan.received {
+            if !context.unresolvable_paths.is_empty() {
+                return Err(err(
+                    "Received deletion predecessor is not verified; this plan cannot be applied.",
+                ));
+            }
+            if plan.operations.iter().any(|o| o.side != context.side) {
+                return Err(err(
+                    "Received preview contains an operation outside its reviewed local side.",
+                ));
+            }
+            if plan.reverses.is_none() {
+                self.check_import_head(&p.id, context)?;
+                let mapped: String = sql(self.db.query_row(
+                    "SELECT plan_id FROM received_attempts WHERE origin=?1 AND sequence=?2",
+                    params![context.pairing_id, context.sequence],
+                    |r| r.get(0),
+                ))?;
+                if mapped != plan.id {
+                    return Err(err(
+                        "Received preview was superseded; approve the current immutable preview.",
+                    ));
+                }
+            }
+        }
         let (s, t) = self.scans(&p)?;
         if s != scan_from_plan(&plan, "source")?
             || t != scan_from_plan(&plan, "target")?
@@ -836,7 +1384,7 @@ impl Engine {
             self.save_plan(&plan)?;
             return Err(err("Final content or permission verification failed. Preserve retained files and create a recovery preview."));
         }
-        let baseline: Snapshot = after_s
+        let mut baseline: Snapshot = after_s
             .iter()
             .filter(|(path, h)| {
                 after_t.get(*path) == Some(*h)
@@ -845,10 +1393,33 @@ impl Engine {
             })
             .map(|(p, h)| (p.clone(), h.clone()))
             .collect();
-        let baseline_permissions: PermissionMap = baseline
+        let mut baseline_permissions: PermissionMap = baseline
             .keys()
             .map(|p| (p.clone(), after_s.metadata.files[p].permissions.clone()))
             .collect();
+        if let Some(context) = &plan.received {
+            // Import history is separate from the pair's shared local history.
+            // Preserve every old entry unless BOTH actual roots now agree on a
+            // reviewed selected path. Never infer unrelated deletion or adopt a
+            // one-sided remote value as the common baseline.
+            let common = baseline;
+            let common_modes = baseline_permissions;
+            baseline = old_baseline;
+            baseline_permissions = old_permissions;
+            for path in context
+                .paths
+                .iter()
+                .chain(plan.operations.iter().map(|o| &o.path))
+            {
+                if let Some(value) = common.get(path) {
+                    baseline.insert(path.clone(), value.clone());
+                    baseline_permissions.insert(path.clone(), common_modes[path].clone());
+                } else if !after_s.contains_key(path) && !after_t.contains_key(path) {
+                    baseline.remove(path);
+                    baseline_permissions.remove(path);
+                }
+            }
+        }
         plan.state = if plan.reverses.is_some() {
             "rolled_back"
         } else {
@@ -862,6 +1433,35 @@ impl Engine {
                 params![encode(&baseline)?,encode(&baseline_permissions)?,p.id],
             ))?;
             self.save_plan(&plan)?;
+            if let Some(context) = &plan.received {
+                if plan.reverses.is_none() {
+                    let (mut remote_hashes, mut remote_modes) =
+                        self.check_import_head(&p.id, context)?;
+                    for path in &context.paths {
+                        set(&mut remote_hashes, path, context.hashes.get(path).cloned());
+                        match context.permissions.get(path) {
+                            Some(mode) => {
+                                remote_modes.insert(path.clone(), mode.clone());
+                            }
+                            None => {
+                                remote_modes.remove(path);
+                            }
+                        }
+                    }
+                    let changed=sql(self.db.execute("UPDATE received_heads SET sequence=?1,digest=?2,hashes=?3,permissions=?4 WHERE origin=?5 AND pair_id=?6 AND side=?7",params![context.sequence,context.digest,encode(&remote_hashes)?,encode(&remote_modes)?,context.pairing_id,p.id,context.side]))?;
+                    if changed != 1 {
+                        return Err(err(
+                            "Received origin binding disappeared; preserve recovery evidence.",
+                        ));
+                    }
+                    self.event(
+                        "received_import_verified",
+                        &p.id,
+                        id,
+                        json!({"received":context}),
+                    )?;
+                }
+            }
             for mut previous in self.plans()? {
                 if previous.pair_id == p.id && previous.id != id && previous.state == "planned" {
                     previous.state = "stale".into();
@@ -1082,7 +1682,16 @@ impl Engine {
                 },
             ));
         }
-        self.new_plan(&p, ops, s, t, revision, Some(id.into()), vec![])
+        self.new_plan_received(
+            &p,
+            ops,
+            s,
+            t,
+            revision,
+            Some(id.into()),
+            vec![],
+            original.received,
+        )
     }
     #[cfg(test)]
     fn write_operation(&self, p: &Pair, o: &Operation, id: &str, index: usize) -> Result<()> {
@@ -1554,7 +2163,8 @@ fn safe_path(path: &str) -> Result<()> {
             .components()
             .any(|c| !matches!(c, Component::Normal(_)))
         || path.split('/').any(|c| {
-            !eligible(c)
+            c.is_empty()
+                || !eligible(c)
                 || c.ends_with('.')
                 || c.ends_with(' ')
                 || matches!(
@@ -1622,7 +2232,10 @@ fn operation(
     }
 }
 fn scan_from_plan(plan: &Plan, side: &str) -> Result<ScanData> {
-    if plan.metadata_version != 1 {
+    if !matches!(
+        (plan.metadata_version, plan.received.is_some()),
+        (1, false) | (2, true)
+    ) {
         return Err(err("Legacy byte-only plans have no trustworthy permission snapshot. Preserve retained files and create a new preview."));
     }
     let (hashes, metadata) = if side == "source" {
@@ -1905,6 +2518,13 @@ pub fn dispatch(state_dir: &Path, request: Value) -> Result<Value> {
             text(&request, "choice")?
         )?),
         "apply" | "rollback" => {
+            if engine
+                .get_plan(text(&request, "plan_id")?)?
+                .received
+                .is_some()
+            {
+                return Err(err("Use the received-proposal workflow to approve and execute this exact received preview."));
+            }
             json!(engine.apply(
                 text(&request, "plan_id")?,
                 text(&request, "approval")?,
@@ -1915,7 +2535,16 @@ pub fn dispatch(state_dir: &Path, request: Value) -> Result<Value> {
                     == Some(true)
             )?)
         }
-        "rollback_preview" => json!(engine.rollback_preview(text(&request, "plan_id")?)?),
+        "rollback_preview" => {
+            if engine
+                .get_plan(text(&request, "plan_id")?)?
+                .received
+                .is_some()
+            {
+                return Err(err("Use the received-proposal workflow to review recovery for this received preview."));
+            }
+            json!(engine.rollback_preview(text(&request, "plan_id")?)?)
+        }
         "events" => engine.events()?,
         "handoff" => {
             let pair_id = text(&request, "pair_id")?;
@@ -1973,6 +2602,589 @@ mod tests {
             fs::create_dir_all(p.parent().unwrap()).unwrap();
             fs::write(p, bytes).unwrap();
         }
+    }
+    fn received_put(path: &str, bytes: &[u8]) -> ReceivedChange {
+        ReceivedChange::Put {
+            path: path.into(),
+            hash: hash(bytes),
+            bytes: bytes.to_vec(),
+            permissions: received_mode(),
+        }
+    }
+    fn received_mode() -> FilePermissions {
+        #[cfg(unix)]
+        {
+            FilePermissions::Unix { mode: 0o600 }
+        }
+        #[cfg(windows)]
+        {
+            FilePermissions::Windows { readonly: false }
+        }
+    }
+    fn received_proposal(
+        sequence: u64,
+        previous: &str,
+        changes: Vec<ReceivedChange>,
+    ) -> ReceivedProposal {
+        let digest = hash(encode(&(sequence, previous, &changes)).unwrap().as_bytes());
+        ReceivedProposal {
+            pairing_id: "a".repeat(64),
+            sequence,
+            digest,
+            previous_digest: previous.into(),
+            changes,
+        }
+    }
+    fn received_preview(e: &Engine, p: &Pair, proposal: &ReceivedProposal) -> Plan {
+        e.preview_received(&p.id, "target", proposal.clone(), &proposal.digest, true)
+            .unwrap()
+    }
+    #[test]
+    fn received_import_is_selected_only_preserves_common_history_and_needs_fresh_exact_approval() {
+        let w = Workspace::new();
+        w.source("selected", b"old");
+        w.source("unrelated", b"common");
+        let e = w.engine();
+        let p = w.register(&e);
+        let initial = e.preview(&p.id).unwrap();
+        e.apply(&initial.id, &initial.id, true, true).unwrap();
+        w.target("unrelated", b"preserved local divergence");
+        let proposal = received_proposal(
+            1,
+            ZERO_IMPORT_DIGEST,
+            vec![received_put("selected", b"received")],
+        );
+        let blocked = received_preview(&e, &p, &proposal);
+        assert_eq!(blocked.operations.len(), 1);
+        assert_eq!(blocked.operations[0].kind, "conflict");
+        assert_eq!(blocked.metadata_version, 2);
+        assert!(e.apply(&blocked.id, &blocked.id, true, true).is_err());
+        let resolved = e
+            .resolve_received_preview(&blocked.id, "selected", "incoming")
+            .unwrap();
+        assert_ne!(resolved.id, blocked.id);
+        assert!(e.apply(&resolved.id, &blocked.id, true, true).is_err());
+        e.apply(&resolved.id, &resolved.id, true, true).unwrap();
+        assert_eq!(fs::read(w.source.join("selected")).unwrap(), b"old");
+        assert_eq!(fs::read(w.target.join("selected")).unwrap(), b"received");
+        assert_eq!(
+            fs::read(w.target.join("unrelated")).unwrap(),
+            b"preserved local divergence"
+        );
+        let (_, baseline, _, _) = e.pair(&p.id).unwrap();
+        assert_eq!(baseline["selected"], hash(b"old"));
+        assert_eq!(baseline["unrelated"], hash(b"common"));
+        let normal = e.preview(&p.id).unwrap();
+        assert!(normal.operations.iter().all(|o| o.kind == "conflict"));
+        assert_eq!(normal.operations.len(), 2);
+        assert_eq!(received_preview(&e, &p, &proposal).id, resolved.id);
+        assert!(e
+            .apply(&resolved.id, &resolved.id, true, true)
+            .unwrap()
+            .changed
+            .is_empty());
+    }
+    #[test]
+    fn received_review_gates_payload_storage_and_rejects_invalid_intent() {
+        let w = Workspace::new();
+        let e = w.engine();
+        let p = w.register(&e);
+        let proposal = received_proposal(
+            1,
+            ZERO_IMPORT_DIGEST,
+            vec![received_put("selected", b"review gate fixture")],
+        );
+        let object = w.state.join("objects").join(hash(b"review gate fixture"));
+        assert!(e
+            .preview_received(&p.id, "target", proposal.clone(), &proposal.digest, false)
+            .is_err());
+        assert!(!object.exists());
+        assert!(e
+            .preview_received(&p.id, "target", proposal.clone(), ZERO_IMPORT_DIGEST, true)
+            .is_err());
+        assert!(!object.exists());
+        let bad = received_proposal(
+            1,
+            ZERO_IMPORT_DIGEST,
+            vec![received_put("../escape", b"review gate fixture")],
+        );
+        assert!(e
+            .preview_received(&p.id, "target", bad.clone(), &bad.digest, true)
+            .is_err());
+        assert!(!object.exists());
+        let secret = b"-----BEGIN PRIVATE KEY----- generated-received-secret-canary";
+        let bad = received_proposal(1, ZERO_IMPORT_DIGEST, vec![received_put("valid", secret)]);
+        assert!(e
+            .preview_received(&p.id, "target", bad.clone(), &bad.digest, true)
+            .is_err());
+        assert!(!w.state.join("objects").join(hash(secret)).exists());
+        assert!(e.plans().unwrap().is_empty());
+        assert!(e.import_head(&proposal.pairing_id).unwrap().is_none());
+    }
+    #[test]
+    fn received_stale_retry_restart_semantic_identity_and_mapping_are_durable() {
+        let w = Workspace::new();
+        let e = w.engine();
+        let p = w.register(&e);
+        let proposal = received_proposal(
+            1,
+            ZERO_IMPORT_DIGEST,
+            vec![received_put("selected", b"received")],
+        );
+        let first = received_preview(&e, &p, &proposal);
+        assert_eq!(received_preview(&e, &p, &proposal).id, first.id);
+        w.source("unrelated", b"new source work");
+        assert!(e.apply(&first.id, &first.id, true, true).is_err());
+        let fresh = received_preview(&e, &p, &proposal);
+        assert_ne!(fresh.id, first.id);
+        assert_eq!(e.get_plan(&first.id).unwrap().state, "stale");
+        let mut altered = proposal.clone();
+        altered.changes = vec![received_put("different", b"altered")];
+        assert!(e
+            .preview_received(&p.id, "target", altered, &proposal.digest, true)
+            .is_err());
+        assert!(e
+            .preview_received(&p.id, "source", proposal.clone(), &proposal.digest, true)
+            .is_err());
+        drop(e);
+        let e = w.engine();
+        e.apply(&fresh.id, &fresh.id, true, true).unwrap();
+        drop(e);
+        let e = w.engine();
+        assert_eq!(received_preview(&e, &p, &proposal).id, fresh.id);
+        assert_eq!(e.get_plan(&fresh.id).unwrap().state, "verified");
+        let gap = received_proposal(3, &proposal.digest, vec![received_put("selected", b"gap")]);
+        assert!(e
+            .preview_received(&p.id, "target", gap.clone(), &gap.digest, true)
+            .is_err());
+        let wrong = received_proposal(
+            2,
+            ZERO_IMPORT_DIGEST,
+            vec![received_put("selected", b"wrong predecessor")],
+        );
+        assert!(e
+            .preview_received(&p.id, "target", wrong.clone(), &wrong.digest, true)
+            .is_err());
+    }
+    #[test]
+    fn received_conflict_keep_both_is_single_side_and_rollback_restores_original_inode() {
+        let w = Workspace::new();
+        w.target("selected", b"local original");
+        let e = w.engine();
+        let p = w.register(&e);
+        let proposal = received_proposal(
+            1,
+            ZERO_IMPORT_DIGEST,
+            vec![received_put("selected", b"remote version")],
+        );
+        let plan = received_preview(&e, &p, &proposal);
+        let before = e.scan(&w.target).unwrap().metadata.files["selected"].clone();
+        let resolved = e
+            .resolve_received_preview(&plan.id, "selected", "both")
+            .unwrap();
+        assert_eq!(resolved.operations.len(), 2);
+        assert!(resolved.operations.iter().all(|o| o.side == "target"));
+        let sibling = resolved
+            .operations
+            .iter()
+            .find(|o| o.path != "selected")
+            .unwrap()
+            .path
+            .clone();
+        assert!(!w.target.join(&sibling).exists());
+        e.apply(&resolved.id, &resolved.id, true, true).unwrap();
+        assert_eq!(
+            fs::read(w.target.join(&sibling)).unwrap(),
+            b"local original"
+        );
+        assert_eq!(fs::read_dir(&w.source).unwrap().count(), 0);
+        let rollback = e.rollback_preview(&resolved.id).unwrap();
+        assert!(rollback.received.is_some());
+        e.apply(&rollback.id, &rollback.id, true, true).unwrap();
+        assert_eq!(
+            fs::read(w.target.join("selected")).unwrap(),
+            b"local original"
+        );
+        assert!(!w.target.join(&sibling).exists());
+        assert_eq!(
+            e.scan(&w.target).unwrap().metadata.files["selected"],
+            before
+        );
+        let next = received_proposal(
+            2,
+            &proposal.digest,
+            vec![received_put("selected", b"next received")],
+        );
+        assert_eq!(
+            received_preview(&e, &p, &next).operations[0].kind,
+            "conflict"
+        );
+    }
+    #[test]
+    fn received_delete_requires_tracked_predecessor_and_has_approved_restore() {
+        let w = Workspace::new();
+        let e = w.engine();
+        let p = w.register(&e);
+        let put = received_proposal(
+            1,
+            ZERO_IMPORT_DIGEST,
+            vec![received_put("selected", b"received")],
+        );
+        let plan = received_preview(&e, &p, &put);
+        e.apply(&plan.id, &plan.id, true, true).unwrap();
+        let bad = received_proposal(
+            2,
+            &put.digest,
+            vec![ReceivedChange::Delete {
+                path: "selected".into(),
+                previous_hash: hash(b"wrong"),
+            }],
+        );
+        let blocked = received_preview(&e, &p, &bad);
+        assert_eq!(blocked.operations[0].kind, "conflict");
+        assert!(!blocked.blockers.is_empty());
+        for choice in ["incoming", "local", "both"] {
+            assert!(e
+                .resolve_received_preview(&blocked.id, "selected", choice)
+                .is_err());
+        }
+        assert!(e.apply(&blocked.id, &blocked.id, true, true).is_err());
+        // A different sequence identity cannot replace even a blocked review.
+        let mut fresh_origin = bad.clone();
+        fresh_origin.pairing_id = "b".repeat(64);
+        fresh_origin.sequence = 1;
+        fresh_origin.previous_digest = ZERO_IMPORT_DIGEST.into();
+        let untracked = received_preview(&e, &p, &fresh_origin);
+        assert_eq!(untracked.operations[0].kind, "conflict");
+        let deletion = received_proposal(
+            2,
+            &put.digest,
+            vec![ReceivedChange::Delete {
+                path: "selected".into(),
+                previous_hash: hash(b"received"),
+            }],
+        );
+        // Preserve the first origin's altered-sequence refusal; use a fresh
+        // fixture for the valid deletion chain.
+        assert!(e
+            .preview_received(&p.id, "target", deletion.clone(), &deletion.digest, true)
+            .is_err());
+        let w = Workspace::new();
+        let e = w.engine();
+        let p = w.register(&e);
+        let plan = received_preview(&e, &p, &put);
+        e.apply(&plan.id, &plan.id, true, true).unwrap();
+        let before = e.scan(&w.target).unwrap().metadata.files["selected"].clone();
+        let plan = received_preview(&e, &p, &deletion);
+        assert_eq!(plan.operations[0].kind, "delete");
+        assert!(w.target.join("selected").exists());
+        e.apply(&plan.id, &plan.id, true, true).unwrap();
+        assert!(!w.target.join("selected").exists());
+        assert!(e.events().unwrap().to_string().contains("tombstone"));
+        let rollback = e.rollback_preview(&plan.id).unwrap();
+        e.apply(&rollback.id, &rollback.id, true, true).unwrap();
+        assert_eq!(
+            e.scan(&w.target).unwrap().metadata.files["selected"],
+            before
+        );
+    }
+    #[test]
+    fn received_interruption_restart_rollback_and_retry_do_not_consume_head() {
+        let w = Workspace::new();
+        let e = w.engine();
+        let p = w.register(&e);
+        let proposal = received_proposal(
+            1,
+            ZERO_IMPORT_DIGEST,
+            vec![received_put("a", b"one"), received_put("b", b"two")],
+        );
+        let plan = received_preview(&e, &p, &proposal);
+        assert!(e.apply_inner(&plan.id, &plan.id, Some(1)).is_err());
+        assert_eq!(e.import_head(&proposal.pairing_id).unwrap().unwrap().2, 0);
+        drop(e);
+        let e = w.engine();
+        assert_eq!(e.get_plan(&plan.id).unwrap().state, "recovery_required");
+        assert!(e
+            .preview_received(&p.id, "target", proposal.clone(), &proposal.digest, true)
+            .is_err());
+        let undo = e.rollback_preview(&plan.id).unwrap();
+        e.apply(&undo.id, &undo.id, true, true).unwrap();
+        assert!(!w.target.join("a").exists());
+        let fresh = received_preview(&e, &p, &proposal);
+        assert_ne!(fresh.id, plan.id);
+        e.apply(&fresh.id, &fresh.id, true, true).unwrap();
+        assert_eq!(e.import_head(&proposal.pairing_id).unwrap().unwrap().2, 1);
+    }
+    #[test]
+    fn received_receipt_failure_keeps_head_uncommitted_and_originals_recoverable() {
+        let w = Workspace::new();
+        let e = w.engine();
+        let p = w.register(&e);
+        let proposal = received_proposal(
+            1,
+            ZERO_IMPORT_DIGEST,
+            vec![received_put("a", b"receipt fixture")],
+        );
+        let plan = received_preview(&e, &p, &proposal);
+        e.db.execute_batch("CREATE TRIGGER reject_received_receipt BEFORE INSERT ON events WHEN NEW.kind='received_import_verified' BEGIN SELECT RAISE(ABORT,'generated receipt rejection'); END;").unwrap();
+        assert!(e.apply(&plan.id, &plan.id, true, true).is_err());
+        assert_eq!(e.import_head(&proposal.pairing_id).unwrap().unwrap().2, 0);
+        assert_eq!(e.get_plan(&plan.id).unwrap().state, "applying");
+        drop(e);
+        let e = w.engine();
+        let undo = e.rollback_preview(&plan.id).unwrap();
+        e.apply(&undo.id, &undo.id, true, true).unwrap();
+        assert!(!w.target.join("a").exists());
+        assert_eq!(e.import_head(&proposal.pairing_id).unwrap().unwrap().2, 0);
+    }
+    #[test]
+    fn received_casefold_ancestor_and_existing_directory_collisions_refuse_before_payload_storage()
+    {
+        let w = Workspace::new();
+        let e = w.engine();
+        let p = w.register(&e);
+        for changes in [
+            vec![received_put("A", b"alias"), received_put("a/b", b"alias")],
+            vec![
+                received_put("Foo/x", b"alias"),
+                received_put("foo/y", b"alias"),
+            ],
+        ] {
+            let proposal = received_proposal(1, ZERO_IMPORT_DIGEST, changes);
+            assert!(e
+                .preview_received(&p.id, "target", proposal.clone(), &proposal.digest, true)
+                .is_err());
+            assert!(!w.state.join("objects").join(hash(b"alias")).exists());
+        }
+        for path in ["a//b", "a/b/"] {
+            let proposal =
+                received_proposal(1, ZERO_IMPORT_DIGEST, vec![received_put(path, b"alias")]);
+            assert!(e
+                .preview_received(&p.id, "target", proposal.clone(), &proposal.digest, true)
+                .is_err());
+            assert!(!w.state.join("objects").join(hash(b"alias")).exists());
+        }
+        fs::create_dir(w.target.join("Existing")).unwrap();
+        for path in ["Existing", "existing/new"] {
+            let proposal =
+                received_proposal(1, ZERO_IMPORT_DIGEST, vec![received_put(path, b"alias")]);
+            assert!(e
+                .preview_received(&p.id, "target", proposal.clone(), &proposal.digest, true)
+                .is_err());
+            assert!(!w.state.join("objects").join(hash(b"alias")).exists());
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn received_permission_widening_metadata_staleness_and_redaction_are_enforced() {
+        use std::os::unix::fs::PermissionsExt;
+        let w = Workspace::new();
+        let e = w.engine();
+        let p = w.register(&e);
+        let mut change = received_put("selected", b"ordinary received payload canary");
+        if let ReceivedChange::Put { permissions, .. } = &mut change {
+            *permissions = FilePermissions::Unix { mode: 0o644 };
+        }
+        let proposal = received_proposal(1, ZERO_IMPORT_DIGEST, vec![change]);
+        let plan = received_preview(&e, &p, &proposal);
+        assert!(plan.operations[0].permission_widening);
+        assert!(e.apply(&plan.id, &plan.id, true, false).is_err());
+        assert!(!w.target.join("selected").exists());
+        e.apply(&plan.id, &plan.id, true, true).unwrap();
+        assert_eq!(
+            fs::metadata(w.target.join("selected"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644
+        );
+        let next = received_proposal(
+            2,
+            &proposal.digest,
+            vec![received_put("selected", b"next received")],
+        );
+        let fresh = received_preview(&e, &p, &next);
+        fs::set_permissions(w.target.join("selected"), fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(e.apply(&fresh.id, &fresh.id, true, true).is_err());
+        let saved = e.events().unwrap().to_string();
+        assert!(!saved.contains("ordinary received payload canary"));
+        assert!(!saved.contains("next received"));
+        assert!(!encode(&plan)
+            .unwrap()
+            .contains("ordinary received payload canary"));
+    }
+    #[test]
+    fn received_invalid_deletion_blocks_mixed_payload_storage_and_schema_two_preserves_normal_plans(
+    ) {
+        let w = Workspace::new();
+        let e = w.engine();
+        let p = w.register(&e);
+        let proposal = received_proposal(
+            1,
+            ZERO_IMPORT_DIGEST,
+            vec![
+                received_put("valid", b"mixed payload"),
+                ReceivedChange::Delete {
+                    path: "untracked".into(),
+                    previous_hash: hash(b"unknown"),
+                },
+            ],
+        );
+        let blocked = received_preview(&e, &p, &proposal);
+        assert!(!blocked.blockers.is_empty());
+        assert!(!w
+            .state
+            .join("objects")
+            .join(hash(b"mixed payload"))
+            .exists());
+        assert!(e
+            .resolve_received_preview(&blocked.id, "untracked", "incoming")
+            .is_err());
+        assert!(e.apply(&blocked.id, &blocked.id, true, true).is_err());
+        let w = Workspace::new();
+        w.source("normal", b"normal migration fixture");
+        let e = w.engine();
+        let p = w.register(&e);
+        let normal = e.preview(&p.id).unwrap();
+        assert_eq!(normal.metadata_version, 1);
+        e.db.execute_batch("DROP TABLE received_attempts; DROP TABLE received_heads; UPDATE schema_version SET version=2;").unwrap();
+        drop(e);
+        let e = w.engine();
+        let version: i64 =
+            e.db.query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+                .unwrap();
+        assert_eq!(version, 3);
+        assert_eq!(e.get_plan(&normal.id).unwrap().metadata_version, 1);
+        e.apply(&normal.id, &normal.id, true, true).unwrap();
+    }
+    #[test]
+    fn received_valid_delete_history_allows_separate_local_divergence_resolution_and_restore() {
+        let w = Workspace::new();
+        let e = w.engine();
+        let p = w.register(&e);
+        let first = received_proposal(
+            1,
+            ZERO_IMPORT_DIGEST,
+            vec![received_put("selected", b"remote baseline")],
+        );
+        let plan = received_preview(&e, &p, &first);
+        e.apply(&plan.id, &plan.id, true, true).unwrap();
+        w.target("selected", b"new local work");
+        let before = e.scan(&w.target).unwrap().metadata.files["selected"].clone();
+        let deletion = received_proposal(
+            2,
+            &first.digest,
+            vec![ReceivedChange::Delete {
+                path: "selected".into(),
+                previous_hash: hash(b"remote baseline"),
+            }],
+        );
+        let plan = received_preview(&e, &p, &deletion);
+        assert_eq!(plan.operations[0].kind, "conflict");
+        assert!(plan.blockers.is_empty());
+        assert!(plan
+            .received
+            .as_ref()
+            .unwrap()
+            .unresolvable_paths
+            .is_empty());
+        let resolved = e
+            .resolve_received_preview(&plan.id, "selected", "incoming")
+            .unwrap();
+        assert!(w.target.join("selected").exists());
+        e.apply(&resolved.id, &resolved.id, true, true).unwrap();
+        assert!(!w.target.join("selected").exists());
+        let undo = e.rollback_preview(&resolved.id).unwrap();
+        e.apply(&undo.id, &undo.id, true, true).unwrap();
+        assert_eq!(
+            fs::read(w.target.join("selected")).unwrap(),
+            b"new local work"
+        );
+        assert_eq!(
+            e.scan(&w.target).unwrap().metadata.files["selected"],
+            before
+        );
+    }
+    #[test]
+    fn received_conflicts_cannot_enter_generic_pair_resolution_or_dispatch_mutation() {
+        let w = Workspace::new();
+        w.source("selected", b"ordinary source");
+        w.target("selected", b"local work");
+        let e = w.engine();
+        let p = w.register(&e);
+        let proposal = received_proposal(
+            1,
+            ZERO_IMPORT_DIGEST,
+            vec![received_put("selected", b"received")],
+        );
+        let plan = received_preview(&e, &p, &proposal);
+        let events = e.events().unwrap();
+        let plan_count = e.plans().unwrap().len();
+        for choice in ["source", "target", "both"] {
+            assert!(e
+                .resolve_preview(&p.id, "selected", choice)
+                .unwrap_err()
+                .0
+                .contains("received-proposal workflow"));
+        }
+        assert_eq!(e.plans().unwrap().len(), plan_count);
+        assert_eq!(e.events().unwrap(), events);
+        drop(e);
+        let resolution =
+            json!({"action":"resolve_preview","pair_id":p.id,"path":"selected","choice":"both"});
+        assert!(dispatch(&w.state, resolution)
+            .unwrap_err()
+            .0
+            .contains("received-proposal workflow"));
+        for action in ["apply", "rollback", "rollback_preview"] {
+            let request = json!({"action":action,"plan_id":plan.id,"approval":plan.id,"disposable_copies":true,"allow_permission_widening":true});
+            assert!(dispatch(&w.state, request)
+                .unwrap_err()
+                .0
+                .contains("received-proposal workflow"));
+        }
+        let e = w.engine();
+        assert_eq!(e.events().unwrap(), events);
+        assert_eq!(e.plans().unwrap().len(), plan_count);
+        assert_eq!(
+            fs::read(w.source.join("selected")).unwrap(),
+            b"ordinary source"
+        );
+        assert_eq!(fs::read(w.target.join("selected")).unwrap(), b"local work");
+        let resolved = e
+            .resolve_received_preview(&plan.id, "selected", "incoming")
+            .unwrap();
+        assert!(e
+            .resolve_preview(&p.id, "selected", "both")
+            .unwrap_err()
+            .0
+            .contains("received-proposal workflow"));
+        drop(e);
+        assert!(dispatch(&w.state,json!({"action":"apply","plan_id":resolved.id,"approval":resolved.id,"disposable_copies":true,"allow_permission_widening":true})).is_err());
+        let e = w.engine();
+        e.apply(&resolved.id, &resolved.id, true, true).unwrap();
+        assert_eq!(fs::read(w.target.join("selected")).unwrap(), b"received");
+    }
+    #[test]
+    fn generic_dispatch_still_applies_and_restores_ordinary_plans() {
+        let w = Workspace::new();
+        w.source("ordinary", b"ordinary payload");
+        let e = w.engine();
+        let p = w.register(&e);
+        let plan = e.preview(&p.id).unwrap();
+        assert!(plan.received.is_none());
+        drop(e);
+        let receipt=dispatch(&w.state,json!({"action":"apply","plan_id":plan.id,"approval":plan.id,"disposable_copies":true,"allow_permission_widening":true})).unwrap();
+        assert_eq!(receipt["state"], "verified");
+        let rollback = dispatch(
+            &w.state,
+            json!({"action":"rollback_preview","plan_id":plan.id}),
+        )
+        .unwrap();
+        let id = rollback["id"].as_str().unwrap();
+        dispatch(&w.state,json!({"action":"rollback","plan_id":id,"approval":id,"disposable_copies":true,"allow_permission_widening":true})).unwrap();
+        assert!(!w.target.join("ordinary").exists());
     }
     #[test]
     fn restart_approval_idempotency_and_exact_preview() {
@@ -2553,7 +3765,7 @@ mod tests {
         let version: i64 =
             e.db.query_row("SELECT version FROM schema_version", [], |r| r.get(0))
                 .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
         let p = w.register(&e);
         let baseline: String =
             e.db.query_row(

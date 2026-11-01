@@ -110,7 +110,7 @@ class SafetyTests(unittest.TestCase):
             self.refused(smoke.empty_state, path)
             self.assertFalse(path.exists())
             with sqlite3.connect(path) as db:
-                db.executescript("CREATE TABLE schema_version(version INTEGER); INSERT INTO schema_version VALUES(2); CREATE TABLE pairs(id TEXT); CREATE TABLE plans(id TEXT);")
+                db.executescript("CREATE TABLE schema_version(version INTEGER); INSERT INTO schema_version VALUES(3); CREATE TABLE pairs(id TEXT); CREATE TABLE plans(id TEXT);")
             before = path.read_bytes()
             smoke.empty_state(path)
             self.assertEqual(path.read_bytes(), before)

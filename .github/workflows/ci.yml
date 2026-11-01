@@ -141,6 +141,66 @@ jobs:
           path: ${{ runner.temp }}/devdrop-process-localhost.json
           if-no-files-found: error
           retention-days: 7
+      - name: Exercise separately approved local peer import (loopback only)
+        run: cargo run -p devdrop-peer --example local_import --locked > "${RUNNER_TEMP}/devdrop-local-import.json"
+      - name: Validate and log bounded local peer import evidence
+        run: |
+          python3 - <<'PY'
+          import json, os, re
+          from pathlib import Path
+          path = Path(os.environ['RUNNER_TEMP']) / 'devdrop-local-import.json'
+          assert path.is_file() and not path.is_symlink() and 0 < path.stat().st_size <= 65536
+          with path.open('rb') as stream:
+              encoded = stream.read(65537)
+          assert len(encoded) <= 65536
+          report = json.loads(encoded)
+          assert set(report) == {'schema', 'fixture_only', 'transport', 'network_apply', 'sparse_staging', 'runtime', 'checks', 'interruption_model', 'queue_proposals'}
+          assert report['schema'] == 'devdrop-local-import-evidence/v1'
+          assert report['fixture_only'] is True and report['network_apply'] is False
+          assert report['sparse_staging'] is False and report['transport'] == 'real-loopback-mtls'
+          runtime = report['runtime']
+          assert set(runtime) == {'os', 'arch'} and runtime == {'os': 'linux', 'arch': 'x86_64'}
+          assert type(report['queue_proposals']) is int and report['queue_proposals'] == 5
+          interruption = 'Injected SQLite receipt commit failure after actual file installation; reopen and approved rollback. No guest or physical power-loss claim.'
+          assert report['interruption_model'] == interruption
+          expected = {
+              'real_loopback_mtls_queues_only',
+              'retained_policy_review_without_live_pairing_keys',
+              'sanitized_review_omits_payload',
+              'exact_digest_disposable_gate_before_cas',
+              'local_application_sequence_is_contiguous',
+              'immutable_plan_and_destination_approval',
+              'receipt_failure_recovery_and_rollback',
+              'durable_preview_receipt_mapping_and_replay',
+              'unmentioned_paths_and_common_baseline_preserved',
+              'dirty_conflict_preserved_on_selected_side_only',
+              'explicit_deletion_and_retained_inode_restore',
+              'rollback_does_not_rewind_remote_history',
+              'permission_widening_requires_extra_approval',
+              'immutable_peer_queue_not_consumed',
+          }
+          assert len(report['checks']) == 14
+          checks = []
+          for check in report['checks']:
+              assert set(check) == {'name', 'passed'}
+              assert re.fullmatch(r'[a-z0-9_]{1,128}', check['name']) and check['passed'] is True
+              checks.append({'name': check['name'], 'passed': True})
+          assert {check['name'] for check in checks} == expected
+          summary = {
+              'schema': report['schema'], 'fixture_only': True,
+              'transport': report['transport'], 'network_apply': False,
+              'sparse_staging': False, 'runtime': {key: runtime[key] for key in ('os', 'arch')},
+              'queue_proposals': 5, 'interruption_model': interruption, 'checks': checks,
+          }
+          print('LOCAL_PEER_IMPORT_EVIDENCE=' + json.dumps(summary, sort_keys=True))
+          PY
+      - name: Save sanitized local peer import evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: devdrop-local-import-evidence
+          path: ${{ runner.temp }}/devdrop-local-import.json
+          if-no-files-found: error
+          retention-days: 7
 
   desktop:
     name: Desktop workflow tests and web build

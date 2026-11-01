@@ -1,12 +1,13 @@
 //! Private bounded proposal journal. This module never applies a project file.
 use crate::{
-    pairing::Paired,
+    pairing::{Paired, Scope},
     wire::{Envelope, Receipt, ReceiptStatus},
     PeerError, PeerResult,
 };
 use devdrop_core::file_permissions as access;
 use fs2::FileExt;
 use rusqlite::{params, Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
@@ -20,6 +21,14 @@ const MAX_STORED_BYTES: u64 = 1024 * 1024;
 const MAX_ENVELOPE_BYTES: usize = 32 * 1024;
 const APPLICATION_ID: u32 = 0x44565051;
 const MARKER: &[u8] = b"devdrop-private-peer-queue-v1\n";
+/// Exact immutable wire proposal reference for local review and approval.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProposalRef {
+    pub pairing_id: String,
+    pub sequence: u64,
+    pub digest: String,
+}
 fn io<T>(value: std::io::Result<T>) -> PeerResult<T> {
     value.map_err(|_| PeerError("Private peer queue filesystem operation failed."))
 }
@@ -295,18 +304,25 @@ impl Inbox {
             sql(db.execute_batch("BEGIN IMMEDIATE;
                 PRAGMA application_id=1146507345;
                 CREATE TABLE schema_version(version INTEGER NOT NULL);
-                INSERT INTO schema_version VALUES(1);
-                CREATE TABLE sessions(id TEXT PRIMARY KEY,local_fingerprint TEXT NOT NULL,remote_fingerprint TEXT NOT NULL,channel TEXT NOT NULL,sequence INTEGER NOT NULL,digest TEXT NOT NULL,encoded_bytes INTEGER NOT NULL);
+                INSERT INTO schema_version VALUES(2);
+                CREATE TABLE sessions(id TEXT PRIMARY KEY,local_fingerprint TEXT NOT NULL,remote_fingerprint TEXT NOT NULL,channel TEXT NOT NULL,sequence INTEGER NOT NULL,digest TEXT NOT NULL,encoded_bytes INTEGER NOT NULL,scope_json TEXT);
                 CREATE TABLE proposals(pairing_id TEXT NOT NULL REFERENCES sessions(id),sequence INTEGER NOT NULL,digest TEXT NOT NULL,payload BLOB NOT NULL,encoded_bytes INTEGER NOT NULL,PRIMARY KEY(pairing_id,sequence));
                 CREATE TABLE events(event_id INTEGER PRIMARY KEY,kind TEXT NOT NULL,pairing_id TEXT NOT NULL,sequence INTEGER NOT NULL,digest TEXT NOT NULL);
                 COMMIT;"))?;
         }
-        require(
-            sql(db.query_row("SELECT version FROM schema_version", [], |r| {
-                r.get::<_, u32>(0)
-            }))? == 1,
-            "Unsupported peer queue schema; preserve its state.",
+        let version = sql(
+            db.query_row("SELECT version FROM schema_version", [], |row| {
+                row.get::<_, u32>(0)
+            }),
         )?;
+        if version == 1 {
+            sql(db.execute_batch("BEGIN IMMEDIATE;ALTER TABLE sessions ADD COLUMN scope_json TEXT;UPDATE schema_version SET version=2;COMMIT;"))?;
+        } else {
+            require(
+                version == 2,
+                "Unsupported peer queue schema; preserve its state.",
+            )?;
+        }
         sync_directory(&root)?;
         Ok(Self {
             root,
@@ -336,6 +352,126 @@ impl Inbox {
             .db
             .query_row("SELECT count(*) FROM events", [], |r| r.get(0)))
     }
+    /// Local metadata listing only. Receiving never marks a proposal applied.
+    pub fn proposal_refs(&self) -> PeerResult<Vec<ProposalRef>> {
+        let mut query=sql(self.db.prepare("SELECT CASE WHEN length(pairing_id)=64 THEN pairing_id END,sequence,CASE WHEN length(digest)=64 THEN digest END FROM proposals ORDER BY pairing_id,sequence LIMIT 65"))?;
+        let rows = sql(query.query_map([], |row| {
+            Ok(ProposalRef {
+                pairing_id: row.get(0)?,
+                sequence: row.get(1)?,
+                digest: row.get(2)?,
+            })
+        }))?;
+        let mut output = Vec::new();
+        for row in rows {
+            let item = sql(row)?;
+            require(
+                output.len() < 64
+                    && digest_valid(&item.pairing_id)
+                    && digest_valid(&item.digest)
+                    && item.sequence > 0
+                    && item.sequence <= 16,
+                "Invalid or excessive local queue metadata.",
+            )?;
+            output.push(item);
+        }
+        Ok(output)
+    }
+    /// Revalidates every retained packet, policy and chain checkpoint without
+    /// reviving expired/revoked network keys. Only the local bridge calls this.
+    pub(crate) fn validated_proposal(&self, reference: &ProposalRef) -> PeerResult<Envelope> {
+        require(
+            digest_valid(&reference.pairing_id)
+                && digest_valid(&reference.digest)
+                && reference.sequence > 0
+                && reference.sequence <= 16,
+            "Invalid exact local proposal reference.",
+        )?;
+        struct Context {
+            local: Option<String>,
+            remote: Option<String>,
+            channel: Option<String>,
+            sequence: u64,
+            digest: Option<String>,
+            used: u64,
+            scope: Option<String>,
+        }
+        let context:Context=sql(self.db.query_row("SELECT CASE WHEN length(local_fingerprint)=64 THEN local_fingerprint END,CASE WHEN length(remote_fingerprint)=64 THEN remote_fingerprint END,CASE WHEN length(channel)<=64 THEN channel END,sequence,CASE WHEN length(digest)=64 THEN digest END,encoded_bytes,CASE WHEN length(scope_json)<=8192 THEN scope_json END FROM sessions WHERE id=?1",[&reference.pairing_id],|row|Ok(Context{local:row.get(0)?,remote:row.get(1)?,channel:row.get(2)?,sequence:row.get(3)?,digest:row.get(4)?,used:row.get(5)?,scope:row.get(6)?})))?;
+        let scope:Scope=serde_json::from_str(context.scope.as_deref().ok_or(PeerError("Legacy or invalid pairing policy is review-only; explicitly pair again before importing."))?).map_err(|_|PeerError("Retained pairing policy is invalid."))?;
+        scope.validate()?;
+        let local = context
+            .local
+            .ok_or(PeerError("Retained local identity is invalid."))?;
+        let remote = context
+            .remote
+            .ok_or(PeerError("Retained remote identity is invalid."))?;
+        let head = context
+            .digest
+            .ok_or(PeerError("Retained checkpoint is invalid."))?;
+        require(
+            context.channel.as_deref() == Some(scope.channel.as_str())
+                && context.sequence > 0
+                && context.sequence <= u64::from(scope.max_messages)
+                && reference.sequence <= context.sequence,
+            "Retained policy and checkpoint differ.",
+        )?;
+        let mut query=sql(self.db.prepare("SELECT sequence,CASE WHEN length(digest)=64 THEN digest END,encoded_bytes,CASE WHEN length(payload)<=32768 THEN payload END FROM proposals WHERE pairing_id=?1 ORDER BY sequence LIMIT 17"))?;
+        let rows = sql(query.query_map([&reference.pairing_id], |row| {
+            Ok((
+                row.get::<_, u64>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, u64>(2)?,
+                row.get::<_, Option<Vec<u8>>>(3)?,
+            ))
+        }))?;
+        let (mut sequence, mut previous, mut used, mut selected) =
+            (0u64, ZERO.to_owned(), 0u64, None);
+        for row in rows {
+            let (number, saved, length, payload) = sql(row)?;
+            let saved = saved.ok_or(PeerError("Retained proposal digest is invalid."))?;
+            let payload = payload.ok_or(PeerError(
+                "Retained proposal exceeds bounded storage policy.",
+            ))?;
+            require(
+                number == sequence + 1
+                    && number <= u64::from(scope.max_messages)
+                    && payload.len() as u64 == length
+                    && payload.len() <= scope.max_bytes_per_proposal as usize,
+                "Retained proposal order or size differs.",
+            )?;
+            let envelope: Envelope = serde_json::from_slice(&payload)
+                .map_err(|_| PeerError("Retained proposal schema is invalid."))?;
+            envelope.validate_stored(&reference.pairing_id, &scope, &remote, &local)?;
+            require(
+                envelope.sequence == number
+                    && envelope.previous_digest == previous
+                    && envelope.digest()? == saved
+                    && envelope.encode()? == payload,
+                "Retained proposal content or chain integrity differs.",
+            )?;
+            used = used
+                .checked_add(length)
+                .ok_or(PeerError("Retained byte accounting overflow."))?;
+            require(
+                used <= u64::from(scope.max_total_bytes),
+                "Retained proposal quota differs.",
+            )?;
+            if number == reference.sequence {
+                require(
+                    saved == reference.digest,
+                    "Local review requires the exact accepted proposal digest.",
+                )?;
+                selected = Some(envelope);
+            }
+            sequence = number;
+            previous = saved;
+        }
+        require(
+            sequence == context.sequence && previous == head && used == context.used,
+            "Retained checkpoint, payloads or byte accounting differ.",
+        )?;
+        selected.ok_or(PeerError("Exact queued proposal is unavailable."))
+    }
     /// Only the authenticated transport calls this from a network request.
     /// Commit means stored for local review, never project apply or stage.
     pub fn accept(&mut self, pair: &Paired, envelope: &Envelope) -> PeerResult<Receipt> {
@@ -349,18 +485,30 @@ impl Inbox {
             "Proposal exceeds its encoded quota.",
         )?;
         let digest = envelope.digest()?;
+        let scope_json = serde_json::to_string(pair.scope())
+            .map_err(|_| PeerError("Cannot retain proposal policy."))?;
         let transaction = sql(self.db.transaction())?;
         sql(transaction.execute(
-            "INSERT OR IGNORE INTO sessions VALUES(?1,?2,?3,?4,0,?5,0)",
+            "INSERT OR IGNORE INTO sessions(id,local_fingerprint,remote_fingerprint,channel,sequence,digest,encoded_bytes,scope_json) VALUES(?1,?2,?3,?4,0,?5,0,?6)",
             params![
                 pair.id(),
                 pair.local_fingerprint(),
                 pair.remote_fingerprint(),
                 pair.scope().channel,
-                ZERO
+                ZERO,
+                scope_json
             ],
         ))?;
         let (local,remote,channel,sequence,previous,used):(String,String,String,u64,String,u64)=sql(transaction.query_row("SELECT local_fingerprint,remote_fingerprint,channel,sequence,digest,encoded_bytes FROM sessions WHERE id=?1",[pair.id()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))))?;
+        let retained_scope: Option<String> = sql(transaction.query_row(
+            "SELECT scope_json FROM sessions WHERE id=?1",
+            [pair.id()],
+            |row| row.get(0),
+        ))?;
+        require(
+            retained_scope.as_deref() == Some(scope_json.as_str()),
+            "Retained pairing policy differs or is legacy; explicitly pair again.",
+        )?;
         require(
             local == pair.local_fingerprint()
                 && remote == pair.remote_fingerprint()
@@ -370,7 +518,7 @@ impl Inbox {
         if envelope.sequence <= sequence {
             let saved: Option<(String, Vec<u8>)> = sql(transaction
                 .query_row(
-                    "SELECT digest,payload FROM proposals WHERE pairing_id=?1 AND sequence=?2",
+                    "SELECT CASE WHEN length(digest)=64 THEN digest END,CASE WHEN length(payload)<=32768 THEN payload END FROM proposals WHERE pairing_id=?1 AND sequence=?2",
                     params![pair.id(), envelope.sequence],
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )
@@ -467,7 +615,7 @@ impl Inbox {
         let row: Option<(String, Vec<u8>)> = sql(self
             .db
             .query_row(
-                "SELECT digest,payload FROM proposals WHERE pairing_id=?1 AND sequence=?2",
+                "SELECT CASE WHEN length(digest)=64 THEN digest END,CASE WHEN length(payload)<=32768 THEN payload END FROM proposals WHERE pairing_id=?1 AND sequence=?2",
                 params![pairing_id, sequence],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
@@ -560,6 +708,119 @@ mod tests {
             reopened.review(b.id(), 1, &receipt.digest).is_ok(),
             "Revocation must preserve local recovery evidence."
         );
+    }
+    #[test]
+    fn retained_policy_chain_and_payload_validate_without_live_pairing_keys() {
+        let root = temp();
+        let path = fs::canonicalize(root.path()).unwrap().join("queue");
+        let (mut inbox, (a, b)) = (Inbox::create_new(&path).unwrap(), pair());
+        let first = Envelope::new(
+            &a,
+            1,
+            ZERO_DIGEST,
+            vec![put(b"retained policy initial fixture")],
+        )
+        .unwrap();
+        let second = Envelope::new(
+            &a,
+            2,
+            &first.digest().unwrap(),
+            vec![put(b"retained policy second fixture")],
+        )
+        .unwrap();
+        inbox.accept(&b, &first).unwrap();
+        inbox.accept(&b, &second).unwrap();
+        let reference = ProposalRef {
+            pairing_id: b.id().into(),
+            sequence: 2,
+            digest: second.digest().unwrap(),
+        };
+        a.revoke();
+        b.revoke();
+        drop(a);
+        drop(b);
+        drop(inbox);
+        let reopened = Inbox::open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .validated_proposal(&reference)
+                .unwrap()
+                .digest()
+                .unwrap(),
+            reference.digest
+        );
+        assert_eq!(reopened.proposal_refs().unwrap().len(), 2);
+        reopened
+            .db
+            .execute("DELETE FROM proposals WHERE sequence=1", [])
+            .unwrap();
+        assert!(reopened.validated_proposal(&reference).is_err());
+    }
+    #[test]
+    fn legacy_scope_migration_preserves_raw_review_but_blocks_import() {
+        let root = temp();
+        let path = fs::canonicalize(root.path()).unwrap().join("queue");
+        let (mut inbox, (a, b)) = (Inbox::create_new(&path).unwrap(), pair());
+        let frame = Envelope::new(&a, 1, ZERO_DIGEST, vec![put(b"legacy queue fixture")]).unwrap();
+        inbox.accept(&b, &frame).unwrap();
+        let reference = ProposalRef {
+            pairing_id: b.id().into(),
+            sequence: 1,
+            digest: frame.digest().unwrap(),
+        };
+        inbox
+            .db
+            .execute_batch(
+                "ALTER TABLE sessions DROP COLUMN scope_json;UPDATE schema_version SET version=1;",
+            )
+            .unwrap();
+        drop(inbox);
+        let reopened = Inbox::open(&path).unwrap();
+        assert!(reopened
+            .review(&reference.pairing_id, 1, &reference.digest)
+            .is_ok());
+        assert!(reopened.validated_proposal(&reference).is_err());
+        assert_eq!(reopened.event_count().unwrap(), 1);
+    }
+    #[test]
+    fn local_import_revalidates_bounded_policy_and_stored_content() {
+        let root = temp();
+        let path = fs::canonicalize(root.path()).unwrap().join("queue");
+        let (mut inbox, (a, b)) = (Inbox::create_new(&path).unwrap(), pair());
+        let frame =
+            Envelope::new(&a, 1, ZERO_DIGEST, vec![put(b"local validation fixture")]).unwrap();
+        inbox.accept(&b, &frame).unwrap();
+        let mut changed = frame.clone();
+        if let Change::Put { path, .. } = &mut changed.changes[0] {
+            *path = "src/unapproved.txt".into();
+        }
+        let bytes = changed.encode().unwrap();
+        let changed_digest = changed.digest().unwrap();
+        inbox
+            .db
+            .execute(
+                "UPDATE proposals SET digest=?1,payload=?2,encoded_bytes=?3",
+                params![changed_digest, bytes, bytes.len()],
+            )
+            .unwrap();
+        inbox
+            .db
+            .execute(
+                "UPDATE sessions SET digest=?1,encoded_bytes=?2",
+                params![changed_digest, bytes.len()],
+            )
+            .unwrap();
+        let reference = ProposalRef {
+            pairing_id: b.id().into(),
+            sequence: 1,
+            digest: changed_digest,
+        };
+        assert!(inbox.validated_proposal(&reference).is_err());
+        inbox
+            .db
+            .execute("UPDATE proposals SET payload=zeroblob(40000)", [])
+            .unwrap();
+        assert!(inbox.validated_proposal(&reference).is_err());
     }
     #[test]
     fn accepted_payload_cursor_and_event_are_one_transaction() {

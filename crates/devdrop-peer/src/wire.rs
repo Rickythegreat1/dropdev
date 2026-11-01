@@ -1,7 +1,7 @@
 //! Strict bounded proposals. TLS authenticates peers; these digests identify
 //! exact proposal bytes for durable ordering, review and retry receipts only.
 use crate::{
-    pairing::{hash, is_hash, validate_path, Paired},
+    pairing::{hash, is_hash, validate_path, Paired, Scope},
     PeerError, PeerResult,
 };
 use devdrop_core::file_permissions::FilePermissions;
@@ -127,19 +127,33 @@ impl Envelope {
     }
     fn validate(&self, pair: &Paired, sender: &str, receiver: &str) -> PeerResult<()> {
         pair.ensure_active()?;
-        pair.scope().validate()?;
+        self.validate_stored(pair.id(), pair.scope(), sender, receiver)
+    }
+    /// Local-only revalidation of an already admitted queue entry. This does
+    /// not grant network admission or require an expired RAM identity to survive.
+    pub(crate) fn validate_stored(
+        &self,
+        pairing_id: &str,
+        scope: &Scope,
+        sender: &str,
+        receiver: &str,
+    ) -> PeerResult<()> {
+        scope.validate()?;
+        if !is_hash(pairing_id) || !is_hash(sender) || !is_hash(receiver) || sender == receiver {
+            return Err(PeerError("Stored proposal identity context is invalid."));
+        }
         if self.version != VERSION
-            || self.pairing_id != pair.id()
+            || self.pairing_id != pairing_id
             || self.sender_fingerprint != sender
             || self.receiver_fingerprint != receiver
-            || self.channel != pair.scope().channel
+            || self.channel != scope.channel
         {
             return Err(PeerError(
                 "Proposal is outside the approved pairing context.",
             ));
         }
         if self.sequence == 0
-            || self.sequence > u64::from(pair.scope().max_messages)
+            || self.sequence > u64::from(scope.max_messages)
             || !is_hash(&self.previous_digest)
             || (self.sequence == 1 && self.previous_digest != ZERO_DIGEST)
         {
@@ -148,7 +162,7 @@ impl Envelope {
             ));
         }
         if self.changes.is_empty()
-            || self.changes.len() > pair.scope().paths.len()
+            || self.changes.len() > scope.paths.len()
             || self.payload_bytes() > MAX_DATA_BYTES
         {
             return Err(PeerError("Proposal exceeds change or data limits."));
@@ -156,7 +170,7 @@ impl Envelope {
         let mut unique = BTreeSet::new();
         for change in &self.changes {
             validate_path(change.path())?;
-            if !pair.scope().paths.contains(change.path())
+            if !scope.paths.contains(change.path())
                 || !unique.insert(change.path().to_ascii_lowercase())
             {
                 return Err(PeerError(
@@ -188,13 +202,13 @@ impl Envelope {
                     }
                 }
                 Change::Delete { previous_hash, .. } => {
-                    if !pair.scope().allow_delete || !is_hash(previous_hash) {
+                    if !scope.allow_delete || !is_hash(previous_hash) {
                         return Err(PeerError("Delete intent is outside the approved scope."));
                     }
                 }
             }
         }
-        if self.encoded_len()? > pair.scope().max_bytes_per_proposal as usize
+        if self.encoded_len()? > scope.max_bytes_per_proposal as usize
             || self.encoded_len()? > 32 * 1024
         {
             return Err(PeerError("Canonical proposal exceeds approved byte limit."));

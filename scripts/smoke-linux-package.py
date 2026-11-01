@@ -288,7 +288,7 @@ def empty_state(path):
     with sqlite3.connect("file:" + quote(str(path), safe="/") + "?mode=ro", uri=True, timeout=0.2) as db:
         db.execute("PRAGMA query_only=ON")
         db.execute("PRAGMA trusted_schema=OFF")
-        require(db.execute("SELECT version FROM schema_version").fetchall() == [(2,)], "unexpected_appdata_schema")
+        require(db.execute("SELECT version FROM schema_version").fetchall() == [(3,)], "unexpected_appdata_schema")
         require(db.execute("SELECT count(*) FROM pairs").fetchone() == (0,), "nonempty_project_registry")
         require(db.execute("SELECT count(*) FROM plans").fetchone() == (0,), "unexpected_sync_plan")
 
@@ -419,10 +419,10 @@ def smoke(context):
             empty_state(database)
             time.sleep(0.5)
         report["checks"].extend([{"name": "mapped_devdrop_window_and_stable_pid_at_least_5_seconds", "passed": True},
-                                 {"name": "frontend_ipc_created_schema2_empty_pairs_and_plans", "passed": True},
+                                 {"name": "frontend_ipc_created_schema3_empty_pairs_and_plans", "passed": True},
                                  {"name": "isolated_xdg_cwd_and_authenticated_x11_without_tcp", "passed": True}])
         report["observed"] = {"window_title": "DevDrop", "map_state": "IsViewable", "stable_seconds_minimum": 5,
-                              "sqlite_schema": 2, "pairs": 0, "plans": 0}
+                              "sqlite_schema": 3, "pairs": 0, "plans": 0}
         report["status"] = "passed"
     except SmokeError as error:
         report["failure"] = {"stage": stage, "code": error.code, "exit_code": error.exit_code, "diagnostic": error.diagnostic}

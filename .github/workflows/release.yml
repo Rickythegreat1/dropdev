@@ -41,6 +41,8 @@ jobs:
         run: cargo test -p devdrop-peer --example localhost --locked
       - name: Test separate-process localhost faults on this platform
         run: cargo test -p devdrop-peer --example process_localhost --locked
+      - name: Test separately approved local peer import on this platform
+        run: cargo test -p devdrop-peer --example local_import --locked
       - run: pnpm typecheck
       - run: pnpm test
       - name: Build local CLI, observer daemon, and read-only MCP server

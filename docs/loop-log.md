@@ -596,3 +596,56 @@ default; classify IPv6 reject sentinels separately. The same awk parser runs in
 guest and pure fixtures. Sixteen safety/model tests pass; independent review
 found no critical issue. This strengthens validation without changing routes,
 addresses, kernel/host settings or the approved network scope.
+
+## 2026-11-01 — Local received-proposal review and approved file application
+
+1. **Task.** Continue from tested `925b56c`: implement a reusable local workflow
+   from durable authenticated proposal through redacted review, exact scoped
+   preview, explicit approval, file/hash/permission verification and rollback.
+   The completed two-VM session is closed; this slice uses disposable local and
+   loopback fixtures only. Any later private guest network requires a new exact
+   action-time request. The version-6 Library handoff remains the prior verified
+   transport checkpoint until this slice passes.
+2. **Touched files.** Core local received-plan types/schema/preview/apply/
+   resolution/recovery and tests; peer Inbox persisted scope and local bridge
+   module/acceptance tests; minimal local Inbox CLI; CI Linux schema observation;
+   docs and independent `docs/local-peer-import-review.md`. Transport admission
+   gains no project read, stage or apply call. No desktop pairing UI or public
+   listener is introduced in this slice.
+3. **Risk.** High: selected filesystem writes, deletes, CAS, remote/local baseline
+   separation and crash boundaries. Never use sparse-folder staging with the
+   full-folder planner. Only explicit proposal paths may become operations;
+   preserve unrelated files/baselines. Core schema 3 prevents old engines from
+   ignoring received-plan provenance. Queue remains read-only recovery evidence,
+   with Core authoritative atomic plan/origin/head/verified receipt state.
+4. **Tests.** Verify actual loopback receipt changes no workspace, exact digest
+   and disposable intent before CAS preview, separate exact-plan apply and
+   permission-widening approvals, native hash/metadata checks, conflicts/keep
+   both, delete predecessor/tombstone/restore, unrelated-file/baseline protection,
+   stale edits/dirty Git, path traversal/exclusions/secret redaction, same/altered
+   replay, sequence gaps/remapping, restart and interrupted-plan recovery. Keep
+   local helper/schema migration tests and required native CI gates meaningful.
+5. **UX.** No desktop surface change. CLI review emits provenance and hashes,
+   counts and supported permissions without raw payload/env values. Review,
+   preview, resolution, apply and rollback are separate local actions; explicit
+   selected roots/paths and beta restrictions stay visible. Native pairing UI,
+   persistent credentials and durable sender outbox remain later work.
+6. **Closeout.** Run feature and sync-invariant/security review before delivery,
+   plus appropriate Rust/CLI/integration/native checks. Preserve failed
+   checkpoints and exact commands in an updated same-identity handoff. Use normal
+   commits without the isolated-network opt-in marker; do not retry the denied
+   PR or bypass Sites hosting. No real user folders, Docker or spending.
+
+Product steering during this slice made durable, agent-friendly version history
+the primary goal. The bounded bridge remains a safe working-copy transaction
+primitive; it is not a commit DAG. Inbox CLI/UI expansion is deferred rather than
+cementing a folder-sync interface before the version-history design. The user
+separately authorized a small reversible history prototype and primary research
+on Git, Jujutsu and Scion; that begins after this checkpoint's evidence is saved.
+
+Local closeout: 161 workspace tests passed, with the existing subprocess helpers
+still explicitly exercised by their parent regressions. Peer local-import
+acceptance passed one test and 14 actual loopback checks. Independent review
+closed invalid-delete, path-alias, schema-downgrade, common-baseline and generic
+UI-dispatch issues. Linux runtime observation now expects Core schema 3. Native
+platform/packaging evidence remains a final CI gate; no new VM network run occurs.
