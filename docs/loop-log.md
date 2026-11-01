@@ -508,3 +508,21 @@ explicit BIOS path but lacked its task-local option-ROM data search path. The
 next change adds `-L` for the extracted official QEMU data and requires its Linux
 loader ROM; the no-NIC command safety test now verifies that path. This changes
 package asset resolution only, with no host installation or isolation change.
+
+Readiness checkpoint `0d23328` passed all three CI checks: two independent Linux
+5.15.0-202 guest kernels under official QEMU 6.2 TCG on one hosted runner, guest B
+actually rebooted with a new boot identity in the same emulator, and host package
+state digest unchanged. Both guests had zero NICs; no DevDrop peer or durable
+queue ran in them. This proves the two-guests-on-one-host software-emulation
+path without relying on KVM. Direct guest-to-guest TLS still needs the precise
+approval scope in `docs/peer-test-plan.md`.
+
+The first installed-package attempt stopped before installation: the exact
+Tauri Debian name is `dev-drop` (kebab-case of `DevDrop`), whereas the original
+guard had expected Cargo-style names. The guard now permits only that confirmed
+name and explicitly rejects the prior guesses/unrelated packages. No payload,
+dependency or maintainer-hook gate was relaxed. Root GNU timeout supervises all
+privileged smoke package commands with a 15-second outer grace. Readiness's
+sole privileged index refresh discards unused output and reports unexpected
+outer timeout as uncertain cleanup. The updated pure safety suites passed
+12 installer checks and six readiness checks without privileged local execution.

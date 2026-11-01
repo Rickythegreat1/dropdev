@@ -2,7 +2,7 @@
 
 Status: process harness reviewed statically and independently executed on Linux:
 two tests and 12 standalone acceptance checks passed. Installer smoke and CI
-source review passed, and 11 pure safety tests passed independently.
+source review passed, and 12 pure safety tests passed independently.
 Installation/startup and native CI execution remain pending.
 This checkpoint is not full package or cross-device acceptance evidence.
 
@@ -83,6 +83,16 @@ timeout cleanup now targets only the newly created command process group,
 using the existing noninteractive sudo authority for a root-owned install
 command; it does not search for or kill unrelated system package processes.
 
+The final narrow review found that an outer sudo process-group kill alone
+cannot prove cleanup when sudo places its workload in a separate PTY/session.
+Privileged package commands now run an inner root GNU `timeout` supervisor
+with TERM and a five-second forced-kill grace. The bounded outer deadline adds
+15 seconds, and its existing targeted cleanup remains a fallback. All current
+privileged call sites discard output, so an early output-budget fault does not
+cut off the root supervisor. Pure tests verify apt/environment argument order,
+dpkg removal wrapping, and unchanged nonprivileged commands. No privileged
+timeout or package operation was run locally by this review.
+
 The application receives a reduced environment preserving the actual HOME;
 scratch XDG directories, cwd, Xauth, and a private D-Bus isolate this generated
 run. Xvfb listens without TCP and uses an authentication cookie, not access
@@ -104,7 +114,7 @@ the required CI context. Independent guard invocation refused with
 `github_actions_required` before creating a report or launching subprocesses.
 Actual package payload compatibility and GUI/runtime results remain CI work.
 
-Independent `python3 -B scripts/test_smoke_linux_package.py`: **11 passed**.
+Independent `python3 -B scripts/test_smoke_linux_package.py`: **12 passed**.
 These tests exercise archive/checksum/metadata and maintainer-hook refusals,
 preserved HOME and reduced app environment, read-only empty SQLite observation,
 mapped window PID, redacted diagnostics, exclusive report creation, bounded
@@ -157,7 +167,21 @@ covering fixed no-NIC/no-share arguments, exact archive namespace/no network
 setup, outside-CI refusal before commands, output-budget cleanup, and a real
 bounded timeout of an owned nonprivileged fixture process. No privileged
 command, package download/extraction, emulator launch, guest boot, or reboot was
-run locally by this review. Actual readiness remains pending the new CI job.
+run locally by this review.
+
+Before `0d23328`, the parent reports the first two hosted readiness attempts timed
+out before any Linux boot signature; the diagnostic retry saw only 141 console
+bytes. The corrective delta supplies QEMU `-L` with its extracted official data
+directory and requires `linuxboot_dma.bin` before launch. This changes firmware
+asset lookup only: no NIC, host share, privileged install, or security-policy
+change was added. Static review found no safety issue in this delta; the updated
+five pure safety tests passed independently. The parent subsequently reports
+the `0d23328` hosted CI passed all three readiness assertions: two independent
+Linux guest boots, guest B reboot with a changed boot identity in the same
+emulator, and unchanged host installed-package state. This review did not run or
+independently retrieve that CI execution. Zero-NIC guests ran no DevDrop peers
+or durable queues. A private networked VM lab remains a proposal requiring the
+separate approvals below.
 
 ## Authorized test boundary
 

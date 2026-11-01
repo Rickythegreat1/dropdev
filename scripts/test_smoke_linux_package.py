@@ -37,7 +37,7 @@ def archive(entries):
     return encoded.getvalue()
 
 
-CONTROL = b"Package: devdrop\nVersion: 0.1.0\nArchitecture: amd64\nDepends: libgtk-3-0, libwebkit2gtk-4.1-0\nDescription: generated fixture\n"
+CONTROL = b"Package: dev-drop\nVersion: 0.1.0\nArchitecture: amd64\nDepends: libgtk-3-0, libwebkit2gtk-4.1-0\nDescription: generated fixture\n"
 PAYLOAD = [
     ("usr", b"", 0o755, "directory"),
     ("usr/bin", b"", 0o755, "directory"),
@@ -73,14 +73,14 @@ class SafetyTests(unittest.TestCase):
 
     def test_control_rejects_hooks_unrelated_packages_and_system_changes(self):
         valid = [("control", CONTROL, 0o644, "file")]
-        self.assertEqual(smoke.inspect_control(archive(valid))["Package"], "devdrop")
+        self.assertEqual(smoke.inspect_control(archive(valid))["Package"], "dev-drop")
         for name in ["postinst", "preinst", "prerm", "postrm", "triggers", "conffiles"]:
             self.refused(smoke.inspect_control, archive(valid + [(name, b"generated", 0o755, "file")]))
-        for changed in [CONTROL.replace(b"Package: devdrop", b"Package: unrelated"), CONTROL + b"Conflicts: openssh-server\n", CONTROL + b"Essential: yes\n", CONTROL.replace(b"libgtk-3-0", b"ufw"), CONTROL.replace(b"libgtk-3-0, libwebkit2gtk-4.1-0", b"libgtk-3-0,\n ufw")]:
+        for changed in [CONTROL.replace(b"Package: dev-drop", b"Package: unrelated"), CONTROL.replace(b"Package: dev-drop", b"Package: devdrop"), CONTROL.replace(b"Package: dev-drop", b"Package: devdrop-desktop"), CONTROL + b"Conflicts: openssh-server\n", CONTROL + b"Essential: yes\n", CONTROL.replace(b"libgtk-3-0", b"ufw"), CONTROL.replace(b"libgtk-3-0, libwebkit2gtk-4.1-0", b"libgtk-3-0,\n ufw")]:
             self.refused(smoke.inspect_control, archive([("control", changed, 0o644, "file")]))
 
     def test_payload_refuses_namespace_metadata_links_and_unsafe_exec(self):
-        self.assertEqual(smoke.inspect_payload(archive(PAYLOAD), "devdrop"), 2)
+        self.assertEqual(smoke.inspect_payload(archive(PAYLOAD), "dev-drop"), 2)
         variants = [
             PAYLOAD + [("etc/generated.conf", b"generated", 0o644, "file")],
             PAYLOAD + [("usr/lib/unrelated", b"", 0o755, "directory")],
@@ -92,7 +92,7 @@ class SafetyTests(unittest.TestCase):
             [PAYLOAD[2], (PAYLOAD[3][0], b"Exec=sh -c generated\n", 0o644, "file")],
         ]
         for entries in variants:
-            self.refused(smoke.inspect_payload, archive(entries), "devdrop")
+            self.refused(smoke.inspect_payload, archive(entries), "dev-drop")
 
     def test_app_env_preserves_home_and_drops_credentials_and_bypass_flags(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"HOME": "/home/runner", "GH_TOKEN": "generated-canary", "WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS": "1"}):
@@ -147,6 +147,14 @@ class SafetyTests(unittest.TestCase):
     def test_bounded_command_refuses_large_output_and_timeout(self):
         self.refused(smoke.command, [sys.executable, "-c", "print('x'*100000)"], "generated_command", limit=1024)
         self.refused(smoke.command, [sys.executable, "-c", "import time; time.sleep(2)"], "generated_command", timeout=0.01)
+
+    def test_root_timeout_supervisor_preserves_package_argv_and_outer_grace(self):
+        args = ["sudo", "-n", "env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "install", "--no-install-recommends", "-y", "/generated/DevDrop.deb"]
+        wrapped, deadline = smoke.supervised_command(args, 300)
+        self.assertEqual(wrapped, ["sudo", "-n", "timeout", "--signal=TERM", "--kill-after=5s", "300"] + args[2:])
+        self.assertEqual(deadline, 315)
+        self.assertEqual(smoke.supervised_command(["sudo", "-n", "dpkg", "--remove", "dev-drop"], 120), (["sudo", "-n", "timeout", "--signal=TERM", "--kill-after=5s", "120", "dpkg", "--remove", "dev-drop"], 135))
+        self.assertEqual(smoke.supervised_command(["xwininfo", "-root"], 2), (["xwininfo", "-root"], 2))
 
     def test_cleanup_stops_only_created_process_group_and_waits(self):
         from unittest.mock import Mock

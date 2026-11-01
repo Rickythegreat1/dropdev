@@ -9,8 +9,14 @@ def sha(path):return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 def command(args,cwd=None,timeout=180,limit=2*1024*1024,environment=None):
     # Keep a root-owned timeout supervisor around the only privileged operation.
     if args[:2]==['sudo','-n']:
+        require(args==['sudo','-n','apt-get','update'],'Only signed package index refresh may run privileged')
         args=args[:2]+['timeout','--signal=TERM','--kill-after=5s',str(timeout)]+args[2:]
-        timeout+=15
+        # This output is never parsed. Discard it so an output-budget failure
+        # cannot terminate sudo before its root-owned workload supervisor.
+        try:result=subprocess.run(args,cwd=cwd,env=environment,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=timeout+15)
+        except subprocess.TimeoutExpired:raise RuntimeError('Privileged index refresh cleanup uncertain; disposable runner teardown required') from None
+        require(result.returncode==0,'Supervised signed index refresh failed exit='+str(result.returncode))
+        return ''
     process=subprocess.Popen(args,cwd=cwd,env=environment,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,start_new_session=True)
     selector=selectors.DefaultSelector();output=bytearray();end=time.monotonic()+timeout;failure=None
     try:

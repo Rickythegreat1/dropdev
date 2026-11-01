@@ -31,4 +31,16 @@ class ReadinessSafety(unittest.TestCase):
   with self.assertRaisesRegex(RuntimeError,'timed out'):
    m.command([sys.executable,'-c','import time;time.sleep(30)'],timeout=0.1)
   self.assertLess(time.monotonic()-start,5)
+ def test_privileged_index_refresh_keeps_root_supervisor_until_exit(self):
+  from subprocess import CompletedProcess,DEVNULL,TimeoutExpired
+  with patch.object(m.subprocess,'run',return_value=CompletedProcess([],0)) as run:
+   self.assertEqual(m.command(['sudo','-n','apt-get','update'],timeout=240),'')
+   args,kwargs=run.call_args
+   self.assertEqual(args[0],['sudo','-n','timeout','--signal=TERM','--kill-after=5s','240','apt-get','update'])
+   self.assertEqual((kwargs['stdout'],kwargs['stderr'],kwargs['timeout']),(DEVNULL,DEVNULL,255))
+  with patch.object(m.subprocess,'run',side_effect=TimeoutExpired('fixture',255)):
+   with self.assertRaisesRegex(RuntimeError,'cleanup uncertain'):m.command(['sudo','-n','apt-get','update'],timeout=240)
+  with patch.object(m.subprocess,'run') as run:
+   with self.assertRaisesRegex(RuntimeError,'Only signed'):m.command(['sudo','-n','apt-get','install','unrelated'])
+   run.assert_not_called()
 if __name__=='__main__':unittest.main()

@@ -26,7 +26,10 @@ from urllib.parse import quote
 
 SCHEMA = "devdrop-linux-runtime-evidence/v1"
 APP = Path("/usr/bin/devdrop-desktop")
-PACKAGES = {"devdrop", "devdrop-desktop"}
+# Tauri's Debian bundler writes heck::AsKebabCase(product_name()) as Package.
+# The tracked productName "DevDrop" therefore generates exactly "dev-drop";
+# Cargo's devdrop-desktop remains the executable name, not the package name.
+PACKAGES = {"dev-drop"}
 
 
 class SmokeError(Exception):
@@ -67,8 +70,17 @@ def ci_context(artifact, report):
             "run_id": os.environ["GITHUB_RUN_ID"], "job_id": os.environ["GITHUB_JOB"]}
 
 
+def supervised_command(args, timeout):
+    if args[:2] == ["sudo", "-n"]:
+        # The timeout supervisor runs as root alongside apt/dpkg, even if sudo
+        # creates a PTY/session with a different process group from its parent.
+        return args[:2] + ["timeout", "--signal=TERM", "--kill-after=5s", str(timeout)] + args[2:], timeout + 15
+    return args, timeout
+
+
 def command(args, code, *, limit=65536, timeout=60, env=None, input_bytes=None, quiet=False):
     """Bound output in RAM; command errors never echo stderr or arguments."""
+    args, timeout = supervised_command(args, timeout)
     process = subprocess.Popen(args, stdin=subprocess.PIPE if input_bytes else subprocess.DEVNULL,
                                stdout=subprocess.DEVNULL if quiet else subprocess.PIPE,
                                stderr=subprocess.DEVNULL, env=env, start_new_session=True)

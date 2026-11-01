@@ -17,6 +17,8 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
+      - name: Test readiness guards without privileged commands
+        run: python3 -B scripts/test-isolated-vm-readiness.py
       - name: Boot and reboot generated guests without network interfaces
         env:
           DEVDROP_PUBLIC_REPOSITORY: ${{ github.event.repository.private == false }}
