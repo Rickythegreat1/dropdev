@@ -465,6 +465,13 @@ Native platform results remain pending until the exact-source CI run is terminal
    Report failures and never-run cross-device/VM-state tests separately, with
    exact action-time prerequisites and no duplicate Sites project or PR retry.
 
+The first readiness CI run at `69dc1d4` failed with a 90-second guest-readiness
+timeout. Package extraction and QEMU launch completed, but no validated guest
+record arrived; no boot or reboot success was inferred. The follow-up removes
+kernel `quiet` and retains only fixed allowlisted boot-signature categories and
+byte count on timeout, never raw console/environment/data, to diagnose this
+generated blank guest without changing isolation or security settings.
+
 ### Corrective platform pass after fd27f53
 
 Native CI at `fd27f535db47deb23460c4ce1d7106cc94682a6c` passed Windows tests,

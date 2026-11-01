@@ -98,13 +98,13 @@ def elf_interpreter(path):
 
 def qemu_args(binary,firmware,kernel,initrd,name):
     require(name in ('devdrop-a','devdrop-b'),'Unknown generated guest identity')
-    return [str(binary),'-name',name,'-machine','pc,dump-guest-core=off,mem-merge=off','-accel','tcg,thread=multi','-cpu','max','-smp','1','-m','512','-nodefaults','-no-user-config','-display','none','-monitor','none','-serial','stdio','-nic','none','-bios',str(firmware),'-kernel',str(kernel),'-initrd',str(initrd),'-append',f'console=ttyS0 rdinit=/init quiet panic=0 devdrop_guest={name}']
+    return [str(binary),'-name',name,'-machine','pc,dump-guest-core=off,mem-merge=off','-accel','tcg,thread=multi','-cpu','max','-smp','1','-m','512','-nodefaults','-no-user-config','-display','none','-monitor','none','-serial','stdio','-nic','none','-bios',str(firmware),'-kernel',str(kernel),'-initrd',str(initrd),'-append',f'console=ttyS0 rdinit=/init panic=0 devdrop_guest={name}']
 
 class Guest:
     def __init__(self,args,environment):
         self.proc=subprocess.Popen(args,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,env=environment)
         try:
-            self.selector=selectors.DefaultSelector();self.selector.register(self.proc.stdout,selectors.EVENT_READ);self.buffer=b'';self.total=0
+            self.selector=selectors.DefaultSelector();self.selector.register(self.proc.stdout,selectors.EVENT_READ);self.buffer=b'';self.total=0;self.boot_signatures=[]
         except Exception:
             self.proc.kill();self.proc.wait(timeout=5)
             for stream in (self.proc.stdin,self.proc.stdout):
@@ -115,6 +115,11 @@ class Guest:
         while time.monotonic()<end:
             while b'\n' in self.buffer:
                 line,self.buffer=self.buffer.split(b'\n',1)
+                # Only fixed diagnostic categories leave this blank guest. No
+                # raw console, memory addresses, environment or guest data.
+                for signature in (b'Linux version',b'Kernel panic',b'Failed to execute /init',b'Run /init',b'Unpacking initramfs',b'Initramfs unpacking failed',b'No working init found',b'Unable to mount root',b'Waiting for root device',b'random: crng init done'):
+                    label=signature.decode('ascii')
+                    if signature in line and label not in self.boot_signatures:self.boot_signatures.append(label)
                 if b'DEVDROP_VM_READY ' in line:
                     record=json.loads(line.split(b'DEVDROP_VM_READY ',1)[1].strip())
                     require(record['schema']=='devdrop-nicless-vm/v1','Wrong guest report schema')
@@ -126,7 +131,7 @@ class Guest:
             if self.selector.select(min(1,max(0,end-time.monotonic()))):
                 chunk=os.read(self.proc.stdout.fileno(),65536);require(bool(chunk),'No-NIC guest console closed')
                 self.total+=len(chunk);require(self.total<=2*1024*1024,'Guest console exceeded its metadata budget');self.buffer+=chunk
-        raise RuntimeError('No-NIC guest readiness timed out')
+        raise RuntimeError('No-NIC guest readiness timed out; console_bytes='+str(self.total)+'; boot_signatures='+json.dumps(self.boot_signatures))
     def send(self,action):
         require(action in ('reboot','poweroff'),'Unknown guest control action');self.proc.stdin.write((action+'\n').encode());self.proc.stdin.flush()
     def close(self):
